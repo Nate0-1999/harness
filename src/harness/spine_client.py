@@ -9,7 +9,7 @@ from enum import StrEnum
 from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 type JsonObject = dict[str, Any]
 
@@ -62,8 +62,43 @@ class MemoryCard(ContractModel):
     kind: MemoryKind
     pin: bool
     score: float
+    features: MemoryFeatures | None
+    rank: int | None
+
+
+class ScoredMemoryCard(MemoryCard):
+    """Inject/prepare card, where C.4 requires scoring details."""
+
     features: MemoryFeatures
     rank: int
+
+
+class SimilarityMemoryCard(MemoryCard):
+    """Dedup/search card, where C.4 requires scoring details to be null."""
+
+    features: None
+    rank: None
+
+
+class MemoryUnit(ContractModel):
+    """Shared C.4 projection of a C.2 memory_unit row, minus embedding."""
+
+    memory_id: UUID
+    principal_id: str
+    label: str
+    body: str
+    kind: MemoryKind
+    keywords: list[str]
+    project_key: str | None
+    thread_origin: str | None
+    pin: bool
+    status: MemoryStatus
+    revision: int
+    stats: JsonObject
+    bias: float
+    embedding_model: str
+    created_at: datetime
+    updated_at: datetime
 
 
 class InjectPrepareRequest(ContractModel):
@@ -81,8 +116,8 @@ class InjectPrepareResponse(ContractModel):
     injection_id: UUID
     snapshot_ts: datetime
     scorer_version: str
-    injected: list[MemoryCard]
-    near_misses: list[MemoryCard]
+    injected: list[ScoredMemoryCard]
+    near_misses: list[ScoredMemoryCard]
 
 
 class RemovedMemory(ContractModel):
@@ -98,6 +133,7 @@ class InjectCommitRequest(ContractModel):
 
 class InjectCommitResponse(ContractModel):
     final_block: str
+    wrong_removed: list[MemoryUnit]
 
 
 class FeedbackRequest(ContractModel):
@@ -119,22 +155,36 @@ class CreateMemoryRequest(ContractModel):
     project_key: str | None = None
     thread_origin: str | None = None
     editor: str
+    machine_id: str
+    force: bool = False
 
 
 class CreatedMemoryResponse(ContractModel):
-    created: MemoryCard
+    created: MemoryUnit
 
 
 class SimilarMemoriesResponse(ContractModel):
     created: None
-    similar: list[MemoryCard]
+    similar: list[SimilarityMemoryCard]
 
 
 type CreateMemoryResponse = CreatedMemoryResponse | SimilarMemoriesResponse
 
 
 class DuplicateMemoryConflict(ContractModel):
-    duplicate_of: MemoryCard
+    duplicate_of: SimilarityMemoryCard
+
+
+class LabelConflictTarget(ContractModel):
+    memory_id: UUID
+    label: str
+
+
+class LabelConflict(ContractModel):
+    label_conflict: LabelConflictTarget
+
+
+type CreateMemoryConflict = DuplicateMemoryConflict | LabelConflict
 
 
 class PatchMemoryRequest(ContractModel):
@@ -147,21 +197,32 @@ class PatchMemoryRequest(ContractModel):
     status: MemoryStatus | None = None
     editor: str
     reason: str
+    machine_id: str
 
 
-# C.4 names these bodies but does not define their fields. They intentionally
-# remain opaque until a contract owner specifies them; P0 must not invent law.
-type PatchMemoryResponse = JsonObject
-type PatchMemoryConflict = JsonObject
+type PatchMemoryResponse = MemoryUnit
+
+
+class RevisionConflict(ContractModel):
+    conflict: MemoryUnit
+
+
+type PatchMemoryConflict = RevisionConflict | LabelConflict
 
 
 class ListMemoriesParams(ContractModel):
     project_key: str | None = None
     status: MemoryStatus | None = None
     q: str | None = None
+    limit: int = Field(default=50, le=200)
+    offset: int = 0
 
 
-type PagedMemoryListResponse = JsonObject
+class PagedMemoryListResponse(ContractModel):
+    items: list[MemoryUnit]
+    total: int
+    limit: int
+    offset: int
 
 
 class SearchRequest(ContractModel):
@@ -172,7 +233,7 @@ class SearchRequest(ContractModel):
 
 
 class SearchResponse(ContractModel):
-    results: list[MemoryCard]
+    results: list[SimilarityMemoryCard]
 
 
 class ProblemDetail(BaseModel):
@@ -207,7 +268,7 @@ class SpineClient:
         raise NotImplementedError("POST /v1/feedback belongs to H2")
 
     async def create_memory(self, request: CreateMemoryRequest) -> CreateMemoryResponse:
-        """Mirror POST /v1/memories; C.4 does not place `force` in the body."""
+        """Mirror POST /v1/memories."""
         raise NotImplementedError("POST /v1/memories belongs to H2")
 
     async def patch_memory(
@@ -217,7 +278,7 @@ class SpineClient:
         raise NotImplementedError("PATCH /v1/memories/{id} belongs to H2")
 
     async def list_memories(self, params: ListMemoriesParams) -> PagedMemoryListResponse:
-        """Mirror GET /v1/memories; C.4 leaves the paged body undefined."""
+        """Mirror GET /v1/memories."""
         raise NotImplementedError("GET /v1/memories belongs to H2")
 
     async def search(self, request: SearchRequest) -> SearchResponse:

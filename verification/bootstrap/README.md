@@ -20,8 +20,8 @@ Observed:
 ```text
 All checks passed!
 13 files already formatted
-s.................. [100%]
-18 passed, 1 skipped in 0.13s
+s........................... [100%]
+27 passed, 1 skipped in 0.49s
 ```
 
 The single skip is intentional and explicit:
@@ -74,7 +74,7 @@ The running daemon returned:
 
 The server was then stopped cleanly.
 
-## Responsive shell — 390×844
+## Responsive shell — 390×844, v1.5 refresh
 
 The built shell was loaded through the running daemon in the in-app browser
 with an explicit 390×844 viewport. The rendered document reported
@@ -83,16 +83,24 @@ occupied exactly 390 CSS pixels with no horizontal overflow. Its accessible
 tree exposed the banner, main heading, scaffold notice, and footer, and the
 browser console contained no errors.
 
-Screenshot: [`shell-390x844.jpg`](shell-390x844.jpg) (390×844).
+Fresh refresh screenshot:
+[`shell-v15-390x844.jpg`](shell-v15-390x844.jpg) (390×844). The original P0
+[`shell-390x844.jpg`](shell-390x844.jpg) remains as historical evidence.
 
 ## Contract, law, and scope checks
 
 - `docs/SPEC.md` compared byte-for-byte equal to
-  `../garden_v1/harness-memory-spec.md`.
-- `AGENTS.md` and `CLAUDE.md` compared equal and contain the PLAN §6 relay
-  template.
-- The C.4 client exposes seven async endpoint stubs; the C.7 enum exposes the
-  eight named M1 message types.
+  the v1.5 master at `../garden_v1/harness-memory-spec.md`.
+- `AGENTS.md` and `CLAUDE.md` compared byte-for-byte equal to the v1.5
+  PLAN §6 relay template.
+- DECISIONS.md Entry 003 records the enacted v1.5 adoption at P1.1 and
+  explicitly supersedes Entry 001's historical opaque-body note.
+- The C.4 client exposes seven async endpoint stubs and mirrors every v1.5
+  resolution from F001–F005 that touches Harness: shared `MemoryUnit`,
+  concrete prepare and explicitly null dedup/search `MemoryCard` details,
+  `wrong_removed`, `machine_id`, similar-band `force`, label/revision
+  conflicts, exact create/PATCH/list bodies, and `limit`/`offset`. The C.7
+  enum still exposes the eight named M1 message types.
 - Source/test/web-source grep found no implementation of the B.4 forbidden
   feature families. `agent.py`, `memory_capability.py`, and `tools_memory.py`
   contain module documentation only.

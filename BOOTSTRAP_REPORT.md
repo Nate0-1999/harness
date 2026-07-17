@@ -1,6 +1,6 @@
 # Agent Zero Bootstrap Report — Harness
 
-Spec reference: `docs/SPEC.md`, frozen v1.4 copy.
+Spec reference: `docs/SPEC.md`, frozen v1.5 copy.
 
 ## What exists now
 
@@ -12,8 +12,10 @@ Spec reference: `docs/SPEC.md`, frozen v1.4 copy.
   eight M1 message types. A valid inbound envelope is echoed with the same
   routing fields, `type="error"`, and `payload="not implemented"`.
 - Typed Pydantic bodies and a seven-method `SpineClient` surface mirroring
-  every body C.4 actually specifies. The PATCH success/conflict bodies and
-  paged-list response remain opaque because C.4 does not define their fields.
+  the complete v1.5 C.4 contract. The shared `MemoryUnit`, context-specific
+  `MemoryCard` feature/rank values, `wrong_removed`, create/PATCH attribution,
+  similar-band `force`, label/revision conflicts, and stable paged-list shapes
+  are all represented without transport behavior.
 - React + TypeScript + Vite placeholder shell with no product behavior,
   network calls, WebSocket calls, or localhost assumption in browser code.
 - Python and web lint/test/build CI, plus a separately named H2 contract-test
@@ -47,14 +49,16 @@ daemon message behavior required by C.10.
 
 Bootstrap command output and scope checks are recorded in
 `verification/bootstrap/README.md`, including the live C.7 echo and the
-390×844 shell screenshot. The scope fence passed the repository and rejected
-a staged forbidden-feature probe. The configurable contract-test job is a
-skeleton and was not represented as a live Spine contract pass. Milestone
-acceptance remains subject to the independent B.6/C.9 judge process.
+fresh v1.5 390×844 shell screenshot. The scope fence passed the repository
+and rejected a staged forbidden-feature probe. The configurable contract-test
+job is a skeleton and was not represented as a live Spine contract pass.
+Milestone acceptance remains subject to the independent B.6/C.9 judge process.
 
-The Garden P0 packet is blocked on FLAGS F001–F005. Those flags concern
-missing or contradictory cross-repository contract details; this scaffold
-does not guess at them.
+The v1.5 P0 refresh incorporates the human resolution of Garden FLAGS
+F001–F005 and SPEC D.2 entries 028–029. No new bootstrap choice was required:
+the refreshed models follow the newly explicit contract. DECISIONS.md Entry
+003 records that dictated adoption and explicitly supersedes Entry 001's
+historical opaque-body note; it does not claim a new local contract choice.
 
 ## Where the gardeners begin
 

@@ -49,3 +49,22 @@ and reproducible without adding a hook framework.
 **Rejected alternatives.** A dependency-heavy pre-commit framework adds no
 useful P0 capability. Scanning `docs/SPEC.md` or the hook's own pattern list
 would make every run fail on the words that define the prohibition.
+
+## 003 — Adopt the enacted v1.5 C.4 completion [P1.1]
+
+**Decision.** This is an adoption record, not a local contract choice. The
+human-enacted SPEC v1.5 resolution in Garden FLAGS F001–F005 and SPEC D.2
+entry 028 supersedes Entry 001's temporary opaque C.4 response models. Mirror
+the enacted shared `MemoryUnit`; context-specific `MemoryCard` feature/rank
+values; `wrong_removed`; create/PATCH `machine_id`; create `force`; label and
+revision conflicts; exact create/PATCH/list responses; and `limit`/`offset`
+query fields in the typed Harness seam.
+
+**Motivation.** The two repositories couple through C.4. Recording the
+supersession keeps the append-only journal historically honest while making
+the current human-approved contract unambiguous to H2 and later readers.
+
+**Rejected alternatives.** Rewriting Entry 001 would erase why P0 originally
+refused to invent contract law. Leaving its opaque-model note as the journal's
+last word would misdirect H2. Declaring a competing local completion would be
+both redundant and beyond P0 authority because v1.5 already supplies the law.
