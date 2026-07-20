@@ -8,6 +8,9 @@ def test_c5_defaults_are_local_minimax_with_bounded_runs_and_spine(monkeypatch) 
     for name in (
         "CHAT_MODEL",
         "SPINE_URL",
+        "PRINCIPAL_ID",
+        "MACHINE_ID",
+        "AGENT_ID",
         "RUN_REQUEST_LIMIT",
         "RUN_TOTAL_TOKENS_LIMIT",
         "LABEL_MAX",
@@ -23,6 +26,9 @@ def test_c5_defaults_are_local_minimax_with_bounded_runs_and_spine(monkeypatch) 
 
     assert settings.chat_model == "openrouter:minimax/minimax-m3"
     assert settings.spine_url == "http://localhost:8000"
+    assert settings.principal_id == "local"
+    assert settings.machine_id == "local-machine"
+    assert settings.agent_id == "harness-agent"
     assert settings.run_request_limit == 40
     assert settings.run_total_tokens_limit == 500_000
     assert settings.label_max == 64
@@ -31,6 +37,9 @@ def test_c5_defaults_are_local_minimax_with_bounded_runs_and_spine(monkeypatch) 
 def test_settings_accept_environment_model_spine_and_limit_overrides(monkeypatch) -> None:
     monkeypatch.setenv("CHAT_MODEL", "anthropic:claude-sonnet-4-6")
     monkeypatch.setenv("SPINE_URL", "https://spine.example.test")
+    monkeypatch.setenv("PRINCIPAL_ID", "principal-test")
+    monkeypatch.setenv("MACHINE_ID", "machine-test")
+    monkeypatch.setenv("AGENT_ID", "agent-test")
     monkeypatch.setenv("RUN_REQUEST_LIMIT", "12")
     monkeypatch.setenv("RUN_TOTAL_TOKENS_LIMIT", "3456")
 
@@ -38,6 +47,9 @@ def test_settings_accept_environment_model_spine_and_limit_overrides(monkeypatch
 
     assert settings.chat_model == "anthropic:claude-sonnet-4-6"
     assert settings.spine_url == "https://spine.example.test"
+    assert settings.principal_id == "principal-test"
+    assert settings.machine_id == "machine-test"
+    assert settings.agent_id == "agent-test"
     assert settings.run_request_limit == 12
     assert settings.run_total_tokens_limit == 3456
 
@@ -46,3 +58,9 @@ def test_settings_accept_environment_model_spine_and_limit_overrides(monkeypatch
 def test_positive_configured_limits_are_enforced(field: str) -> None:
     with pytest.raises(ValidationError):
         HarnessSettings(_env_file=None, **{field: 0})
+
+
+@pytest.mark.parametrize("field", ["principal_id", "machine_id", "agent_id"])
+def test_configured_runtime_identities_cannot_be_empty(field: str) -> None:
+    with pytest.raises(ValidationError):
+        HarnessSettings(_env_file=None, **{field: ""})

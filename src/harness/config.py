@@ -15,6 +15,9 @@ class HarnessSettings(BaseSettings):
 
     spine_url: str = "http://localhost:8000"
     spine_token: SecretStr | None = None
+    principal_id: str = Field(default="local", min_length=1)
+    machine_id: str = Field(default="local-machine", min_length=1)
+    agent_id: str = Field(default="harness-agent", min_length=1)
     anthropic_api_key: SecretStr | None = None
     openai_api_key: SecretStr | None = None
     openrouter_api_key: SecretStr | None = None

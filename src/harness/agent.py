@@ -14,6 +14,7 @@ from pydantic_ai.providers import Provider
 from pydantic_ai.providers.anthropic import AnthropicProvider
 from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.providers.openrouter import OpenRouterProvider
+from pydantic_ai.usage import RunUsage
 
 from harness.config import HarnessSettings
 from harness.pydantic_ai_adapter import MemoryCapability
@@ -138,6 +139,8 @@ class HarnessAgent:
         *,
         context: MemoryToolContext,
         model: Model | str | None = None,
+        usage: RunUsage | None = None,
+        raise_model_errors: bool = False,
     ) -> RememberResult:
         """Generate one valid label, save one global user fact, and confirm honestly."""
 
@@ -151,8 +154,11 @@ class HarnessAgent:
                 f"Memory:\n{body}",
                 model=selected_model,
                 usage_limits=self._label_usage_limits,
+                usage=usage,
             )
         except Exception:
+            if raise_model_errors:
+                raise
             return RememberResult(False, "Could not remember: label generation failed.")
 
         if not isinstance(label_result.output, str):
@@ -196,12 +202,20 @@ class HarnessAgent:
         context: MemoryToolContext,
         message_history: Sequence[Any] | None = None,
         model: Model | str | None = None,
+        usage: RunUsage | None = None,
+        raise_model_errors: bool = False,
     ) -> DispatchResult:
         """Route only the exact `/remember` command; all other text is chat."""
 
-        remembered_text = _remember_command_text(text)
+        remembered_text = remember_command_text(text)
         if remembered_text is not None:
-            return await self.remember(remembered_text, context=context, model=model)
+            return await self.remember(
+                remembered_text,
+                context=context,
+                model=model,
+                usage=usage,
+                raise_model_errors=raise_model_errors,
+            )
         return await self.chat(
             text,
             context=context,
@@ -249,7 +263,9 @@ def _required_secret(value: SecretStr | None, name: str) -> str:
     return value.get_secret_value()
 
 
-def _remember_command_text(text: str) -> str | None:
+def remember_command_text(text: str) -> str | None:
+    """Return the exact `/remember` argument, or None for ordinary chat."""
+
     prefix = "/remember"
     if text == prefix:
         return ""

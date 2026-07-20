@@ -1,18 +1,32 @@
+from __future__ import annotations
+
+import asyncio
 import json
+from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from pydantic_ai.models.function import FunctionModel
 from starlette.websockets import WebSocketDisconnect
 
-from harness.daemon import EnvelopeSender, _build_web, create_app
-from harness.envelope import Envelope, MessageType
+from harness.agent import HarnessAgent
+from harness.config import HarnessSettings
+from harness.daemon import EnvelopeSender, _build_web, create_app, create_dev_app
+from harness.envelope import Envelope, EnvelopeFactory, MessageType, StopReason
+from harness.run_loop import RunLoop
+from harness.run_protocol import RunEmitter, TurnOutcome, UsageSnapshot
+
+PROMPT_ID = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+SECOND_PROMPT_ID = "01ARZ3NDEKTSV4RRFFQ69G5FAW"
+CANCEL_ID = "01ARZ3NDEKTSV4RRFFQ69G5FAX"
+SNAPSHOT_ID = "01ARZ3NDEKTSV4RRFFQ69G5FAY"
 
 
 def valid_envelope() -> dict[str, object]:
     return {
         "v": 1,
-        "id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "id": PROMPT_ID,
         "ts": "2026-07-17T12:00:00Z",
         "machine_id": "machine-1",
         "agent_id": "agent-1",
@@ -22,9 +36,84 @@ def valid_envelope() -> dict[str, object]:
     }
 
 
+def frame(
+    message_type: str,
+    payload: object,
+    *,
+    message_id: str = PROMPT_ID,
+    thread_id: str | None = "thread-1",
+) -> dict[str, object]:
+    message = {
+        **valid_envelope(),
+        "id": message_id,
+        "type": message_type,
+        "payload": payload,
+    }
+    if thread_id is None:
+        message.pop("thread_id")
+    else:
+        message["thread_id"] = thread_id
+    return message
+
+
 def envelope_with_raw_payload(payload: str) -> str:
     raw = json.dumps({**valid_envelope(), "payload": None})
     return raw.replace('"payload": null', f'"payload": {payload}', 1)
+
+
+def receive_until(websocket, message_type: str) -> tuple[dict[str, object], list[str]]:
+    seen: list[str] = []
+    for _ in range(12):
+        message = websocket.receive_json()
+        seen.append(message["type"])
+        if message["type"] == message_type:
+            return message, seen
+    raise AssertionError(f"did not receive {message_type}; saw {seen}")
+
+
+class CancellableRunner:
+    def __init__(self, *, cleanup_delay: float = 0) -> None:
+        self.cleanup_delay = cleanup_delay
+        self.calls: list[str] = []
+
+    async def run(
+        self,
+        *,
+        thread_id: str,
+        prompt: str,
+        message_history: Sequence[object],
+        emit: RunEmitter,
+    ) -> TurnOutcome:
+        del thread_id
+        self.calls.append(prompt)
+        if prompt != "first":
+            await emit.text(f"answer:{prompt}")
+            return TurnOutcome(
+                StopReason.END_TURN,
+                (*message_history, f"{prompt}:done"),
+                UsageSnapshot(1, 2, 3),
+            )
+
+        await emit.text("kept partial")
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            if self.cleanup_delay:
+                await asyncio.sleep(self.cleanup_delay)
+            return TurnOutcome(
+                StopReason.CANCELLED,
+                (*message_history, "first:cancelled-tool"),
+                UsageSnapshot(1, 2, 1),
+            )
+
+
+def app_with_runner(runner: CancellableRunner, tmp_path: Path):
+    factory = EnvelopeFactory(machine_id="daemon-test")
+    return create_app(
+        tmp_path,
+        run_loop=RunLoop(runner, factory),
+        envelope_factory=factory,
+    )
 
 
 def test_serves_built_web_static(tmp_path: Path) -> None:
@@ -64,77 +153,394 @@ def test_dev_build_uses_locked_install_before_vite_build(
     ]
 
 
-def test_ws_returns_same_shaped_not_implemented_error(tmp_path: Path) -> None:
+def test_default_prompt_gets_fresh_correlated_error_lifecycle(tmp_path: Path) -> None:
     client = TestClient(create_app(tmp_path))
-    incoming = valid_envelope()
 
     with client.websocket_connect("/ws") as websocket:
-        websocket.send_json(incoming)
+        websocket.send_json(valid_envelope())
+        started = websocket.receive_json()
+        usage = websocket.receive_json()
+        done = websocket.receive_json()
+
+    assert started["type"] == "run.started"
+    assert started["id"] != PROMPT_ID
+    assert started["machine_id"] == "harness-daemon"
+    assert started["payload"]["prompt_id"] == PROMPT_ID
+    run_id = started["payload"]["run_id"]
+    assert usage == {
+        **usage,
+        "type": "run.usage",
+        "payload": {
+            "run_id": run_id,
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+        },
+    }
+    assert done["type"] == "run.done"
+    assert done["payload"] == {
+        "run_id": run_id,
+        "stop_reason": "error",
+        "partial": True,
+    }
+    assert len({started["id"], usage["id"], done["id"]}) == 3
+
+
+def test_dev_app_wires_the_real_streaming_agent_adapter(tmp_path: Path) -> None:
+    async def stream(_messages, _info):
+        yield "wired response"
+
+    settings = HarnessSettings(
+        _env_file=None,
+        spine_token="test-token",
+        principal_id="principal-test",
+        machine_id="machine-test",
+        agent_id="agent-test",
+        anthropic_api_key=None,
+        openai_api_key=None,
+        openrouter_api_key=None,
+    )
+    agent = HarnessAgent(settings, model=FunctionModel(stream_function=stream))
+    app = create_dev_app(tmp_path, settings=settings, agent=agent)
+    thread_id = "22345678-1234-5678-1234-567812345678"
+
+    with TestClient(app) as client, client.websocket_connect("/ws") as websocket:
+        websocket.send_json(
+            frame(
+                "prompt.submit",
+                {"prompt": "hello"},
+                thread_id=thread_id,
+            )
+        )
+        messages: list[dict[str, object]] = []
+        while True:
+            message = websocket.receive_json()
+            messages.append(message)
+            if message["type"] == "run.done":
+                break
+
+    assert messages[0]["type"] == "run.started"
+    assert messages[-1]["payload"]["stop_reason"] == "end_turn"
+    assert messages[-1]["payload"]["partial"] is False
+    assert any(
+        message["type"] == "run.delta"
+        and message["payload"].get("kind") == "text"
+        and message["payload"].get("text") == "wired response"
+        for message in messages
+    )
+    assert all(message["machine_id"] == "machine-test" for message in messages)
+    assert all(message["agent_id"] == "agent-test" for message in messages)
+
+
+def test_unimplemented_known_type_uses_fresh_daemon_error(tmp_path: Path) -> None:
+    client = TestClient(create_app(tmp_path))
+
+    with client.websocket_connect("/ws") as websocket:
+        websocket.send_json(frame("thread.create", {}))
         response = websocket.receive_json()
 
-    assert response == {
-        **incoming,
-        "ts": "2026-07-17T12:00:00Z",
-        "type": "error",
-        "payload": "not implemented",
-    }
+    assert response["type"] == "error"
+    assert response["payload"] == "not implemented"
+    assert response["id"] != PROMPT_ID
+    assert response["machine_id"] == "harness-daemon"
+    assert response["thread_id"] == "thread-1"
 
 
-def test_ws_routes_every_c7_type_to_its_handler(tmp_path: Path) -> None:
+def test_ws_custom_route_overrides_known_loop_handler(tmp_path: Path) -> None:
     routed: list[MessageType] = []
-    routes = {}
-    for message_type in MessageType:
 
-        async def handler(
-            message: Envelope,
-            send: EnvelopeSender,
-            *,
-            expected: MessageType = message_type,
-        ) -> None:
-            assert message.type is expected
-            routed.append(expected)
-            await send(
-                message.model_copy(
-                    update={
-                        "type": MessageType.ERROR,
-                        "payload": {"routed": expected.value},
-                    }
-                )
-            )
+    async def handler(message: Envelope, send: EnvelopeSender) -> None:
+        assert isinstance(message.type, MessageType)
+        routed.append(message.type)
+        await send(message.model_copy(update={"type": MessageType.ERROR, "payload": "routed"}))
 
-        routes[message_type] = handler
-
-    client = TestClient(create_app(tmp_path, routes=routes))
+    client = TestClient(create_app(tmp_path, routes={MessageType.PROMPT_SUBMIT: handler}))
 
     with client.websocket_connect("/ws") as websocket:
-        for message_type in MessageType:
-            incoming = valid_envelope()
-            incoming["type"] = message_type.value
-            websocket.send_json(incoming)
-            response = websocket.receive_json()
-            assert response["payload"] == {"routed": message_type.value}
+        websocket.send_json(valid_envelope())
+        response = websocket.receive_json()
 
-    assert routed == list(MessageType)
+    assert response["type"] == "error"
+    assert response["payload"] == "routed"
+    assert routed == [MessageType.PROMPT_SUBMIT]
 
 
-def test_ws_handler_may_stream_multiple_envelopes(tmp_path: Path) -> None:
+def test_ws_handler_may_stream_multiple_valid_envelopes(tmp_path: Path) -> None:
+    factory = EnvelopeFactory(machine_id="daemon-test")
+
     async def stream(message: Envelope, send: EnvelopeSender) -> None:
         for index in range(2):
             await send(
-                message.model_copy(
-                    update={
-                        "type": MessageType.RUN_DELTA,
-                        "payload": {"index": index},
-                    }
+                factory.create(
+                    MessageType.ERROR,
+                    {"index": index},
+                    thread_id=message.thread_id,
                 )
             )
 
-    client = TestClient(create_app(tmp_path, routes={MessageType.PROMPT_SUBMIT: stream}))
+    client = TestClient(
+        create_app(
+            tmp_path,
+            routes={MessageType.PROMPT_SUBMIT: stream},
+            envelope_factory=factory,
+        )
+    )
 
     with client.websocket_connect("/ws") as websocket:
         websocket.send_json(valid_envelope())
         assert websocket.receive_json()["payload"] == {"index": 0}
         assert websocket.receive_json()["payload"] == {"index": 1}
+
+
+def test_ws_cancel_midstream_confirms_and_preserves_partial_work(tmp_path: Path) -> None:
+    runner = CancellableRunner()
+    client = TestClient(app_with_runner(runner, tmp_path))
+
+    with client.websocket_connect("/ws") as websocket:
+        websocket.send_json(frame("prompt.submit", {"prompt": "first"}))
+        started = websocket.receive_json()
+        delta = websocket.receive_json()
+        run_id = started["payload"]["run_id"]
+        assert delta["payload"] == {
+            "run_id": run_id,
+            "kind": "text",
+            "text": "kept partial",
+        }
+
+        websocket.send_json(
+            frame(
+                "run.cancel",
+                {"run_id": run_id},
+                message_id=CANCEL_ID,
+                thread_id=None,
+            )
+        )
+        done, seen = receive_until(websocket, "run.done")
+        assert seen == ["run.usage", "run.done"]
+        assert done["payload"] == {
+            "run_id": run_id,
+            "stop_reason": "cancelled",
+            "partial": True,
+        }
+
+        websocket.send_json(
+            frame(
+                "thread.snapshot",
+                {"request": True},
+                message_id=SNAPSHOT_ID,
+            )
+        )
+        snapshot = websocket.receive_json()
+
+    assert snapshot["type"] == "thread.snapshot"
+    assistant = next(
+        message for message in snapshot["payload"]["messages"] if message["role"] == "assistant"
+    )
+    assert assistant["content"] == "kept partial"
+    assert assistant["partial"] is True
+    assert runner.calls == ["first"]
+
+
+def test_ws_duplicate_cancel_while_cleanup_pending_shares_one_confirmation(
+    tmp_path: Path,
+) -> None:
+    runner = CancellableRunner(cleanup_delay=0.03)
+    client = TestClient(app_with_runner(runner, tmp_path))
+
+    with client.websocket_connect("/ws") as websocket:
+        websocket.send_json(frame("prompt.submit", {"prompt": "first"}))
+        started = websocket.receive_json()
+        assert websocket.receive_json()["type"] == "run.delta"
+        run_id = started["payload"]["run_id"]
+
+        websocket.send_json(
+            frame(
+                "run.cancel",
+                {"run_id": run_id},
+                message_id=CANCEL_ID,
+            )
+        )
+        websocket.send_json(
+            frame(
+                "run.cancel",
+                {"run_id": run_id},
+                message_id=SNAPSHOT_ID,
+            )
+        )
+        _, seen = receive_until(websocket, "run.done")
+        assert seen.count("run.done") == 1
+        assert "error" not in seen
+
+        websocket.send_json(
+            frame(
+                "thread.snapshot",
+                {"request": True},
+                message_id="01ARZ3NDEKTSV4RRFFQ69G5FAZ",
+            )
+        )
+        next_message = websocket.receive_json()
+
+    assert next_message["type"] == "thread.snapshot"
+    assert runner.calls == ["first"]
+
+
+def test_ws_queues_prompt_and_runs_it_once_after_terminal_boundary(tmp_path: Path) -> None:
+    runner = CancellableRunner()
+    client = TestClient(app_with_runner(runner, tmp_path))
+
+    with client.websocket_connect("/ws") as websocket:
+        websocket.send_json(frame("prompt.submit", {"prompt": "first"}))
+        first_started = websocket.receive_json()
+        assert websocket.receive_json()["type"] == "run.delta"
+        first_run_id = first_started["payload"]["run_id"]
+
+        websocket.send_json(
+            frame(
+                "prompt.submit",
+                {"prompt": "second"},
+                message_id=SECOND_PROMPT_ID,
+            )
+        )
+        queued = websocket.receive_json()
+        second_run_id = queued["payload"]["run_id"]
+        assert queued == {
+            **queued,
+            "type": "prompt.queued",
+            "payload": {
+                "run_id": second_run_id,
+                "prompt_id": SECOND_PROMPT_ID,
+            },
+        }
+
+        websocket.send_json(
+            frame(
+                "run.cancel",
+                {"run_id": first_run_id},
+                message_id=CANCEL_ID,
+            )
+        )
+        messages: list[dict[str, object]] = []
+        while True:
+            message = websocket.receive_json()
+            messages.append(message)
+            if message["type"] == "run.done" and message["payload"]["run_id"] == second_run_id:
+                break
+
+    indexed = [(message["type"], message["payload"]["run_id"]) for message in messages]
+    assert indexed.index(("run.done", first_run_id)) < indexed.index(("run.started", second_run_id))
+    assert indexed.count(("run.started", second_run_id)) == 1
+    assert indexed.count(("run.done", second_run_id)) == 1
+    assert runner.calls == ["first", "second"]
+
+
+def test_ws_reconnect_hydrates_once_from_snapshot_without_delta_replay(
+    tmp_path: Path,
+) -> None:
+    runner = CancellableRunner()
+    with TestClient(app_with_runner(runner, tmp_path)) as client:
+        with client.websocket_connect("/ws") as first_socket:
+            first_socket.send_json(frame("prompt.submit", {"prompt": "first"}))
+            started = first_socket.receive_json()
+            delta = first_socket.receive_json()
+            assert delta["type"] == "run.delta"
+            run_id = started["payload"]["run_id"]
+
+        with client.websocket_connect("/ws") as reconnected:
+            snapshot = reconnected.receive_json()
+            assert snapshot["type"] == "thread.snapshot"
+            assert snapshot["payload"]["active_run"]["run_id"] == run_id
+            assert snapshot["payload"]["messages"][-1]["content"] == "kept partial"
+
+            reconnected.send_json(
+                frame(
+                    "run.cancel",
+                    {"run_id": run_id},
+                    message_id=CANCEL_ID,
+                    thread_id=None,
+                )
+            )
+            _, seen = receive_until(reconnected, "run.done")
+
+    assert "thread.snapshot" not in seen
+    assert "run.delta" not in seen
+    assert runner.calls == ["first"]
+
+
+@pytest.mark.parametrize("message_type", ["relay.connect", "run.steer"])
+def test_unknown_and_reserved_types_forward_unchanged_or_ignore(
+    tmp_path: Path, message_type: str
+) -> None:
+    forwarded: list[Envelope] = []
+
+    async def forward(message: Envelope) -> None:
+        forwarded.append(message)
+
+    client = TestClient(create_app(tmp_path, forward_unknown=forward))
+    incoming = frame(message_type, {"future": [1, True, None]})
+
+    with client.websocket_connect("/ws") as websocket:
+        websocket.send_json(incoming)
+        websocket.send_json(
+            frame(
+                "thread.snapshot",
+                {"request": True},
+                message_id=SNAPSHOT_ID,
+            )
+        )
+        response = websocket.receive_json()
+
+    assert response["type"] == "thread.snapshot"
+    assert len(forwarded) == 1
+    assert forwarded[0].model_dump(mode="json", exclude_none=True) == incoming
+
+
+def test_unknown_type_without_forwarder_is_ignored_without_closing(tmp_path: Path) -> None:
+    client = TestClient(create_app(tmp_path))
+
+    with client.websocket_connect("/ws") as websocket:
+        websocket.send_json(frame("relay.connect", {"opaque": "value"}))
+        websocket.send_json(
+            frame(
+                "thread.snapshot",
+                {"request": True},
+                message_id=SNAPSHOT_ID,
+            )
+        )
+        response = websocket.receive_json()
+
+    assert response["type"] == "thread.snapshot"
+    assert response["payload"] == {
+        "messages": [],
+        "open_gate": None,
+        "active_run": None,
+    }
+
+
+def test_snapshot_request_is_enqueued_before_a_later_direct_route_response(
+    tmp_path: Path,
+) -> None:
+    client = TestClient(create_app(tmp_path))
+
+    with client.websocket_connect("/ws") as websocket:
+        websocket.send_json(
+            frame(
+                "thread.snapshot",
+                {"request": True},
+                message_id=SNAPSHOT_ID,
+            )
+        )
+        websocket.send_json(
+            frame(
+                "thread.create",
+                {},
+                message_id="01ARZ3NDEKTSV4RRFFQ69G5FAZ",
+            )
+        )
+        first = websocket.receive_json()
+        second = websocket.receive_json()
+
+    assert first["type"] == "thread.snapshot"
+    assert second["type"] == "error"
 
 
 @pytest.mark.parametrize(
@@ -146,7 +552,14 @@ def test_ws_handler_may_stream_multiple_envelopes(tmp_path: Path) -> None:
         json.dumps({**valid_envelope(), "payload": float("nan")}),
         json.dumps({key: value for key, value in valid_envelope().items() if key != "payload"}),
         json.dumps({**valid_envelope(), "v": 2}),
-        json.dumps({**valid_envelope(), "type": "relay.connect"}),
+        json.dumps({**valid_envelope(), "type": " "}),
+        json.dumps(
+            {
+                **valid_envelope(),
+                "type": "run.delta",
+                "payload": {"kind": "text", "text": "missing run"},
+            }
+        ),
         json.dumps({**valid_envelope(), "localhost": True}),
     ],
 )
@@ -205,19 +618,19 @@ def test_ws_stops_routing_after_first_malformed_message(tmp_path: Path) -> None:
 
     async def handler(message: Envelope, send: EnvelopeSender) -> None:
         routed.append(message.id)
-        await send(message.model_copy(update={"type": MessageType.RUN_DONE}))
+        await send(message.model_copy(update={"type": MessageType.ERROR, "payload": "routed"}))
 
     client = TestClient(create_app(tmp_path, routes={MessageType.PROMPT_SUBMIT: handler}))
 
     with client.websocket_connect("/ws") as websocket:
         websocket.send_json(valid_envelope())
-        assert websocket.receive_json()["type"] == "run.done"
+        assert websocket.receive_json()["type"] == "error"
         websocket.send_text("{")
         with pytest.raises(WebSocketDisconnect) as caught:
             websocket.receive_json()
 
     assert caught.value.code == 1008
-    assert routed == ["01ARZ3NDEKTSV4RRFFQ69G5FAV"]
+    assert routed == [PROMPT_ID]
 
 
 @pytest.mark.parametrize("path", ["/ws/", "/unknown"])
@@ -227,7 +640,7 @@ def test_built_static_mode_rejects_unknown_websocket_path(tmp_path: Path, path: 
 
     with client.websocket_connect("/ws") as websocket:
         websocket.send_json(valid_envelope())
-        assert websocket.receive_json()["type"] == "error"
+        assert websocket.receive_json()["type"] == "run.started"
 
     with client.websocket_connect(path) as websocket:
         with pytest.raises(WebSocketDisconnect) as caught:

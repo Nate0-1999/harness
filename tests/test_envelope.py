@@ -1,15 +1,42 @@
-from datetime import datetime
+from collections.abc import Iterator
+from datetime import UTC, datetime
 
 import pytest
 from pydantic import ValidationError
 
-from harness.envelope import Envelope, MessageType
+from harness.envelope import (
+    ActiveRunSnapshot,
+    Envelope,
+    EnvelopeFactory,
+    GateCommitPayload,
+    GateDismissPayload,
+    GateOpenPayload,
+    MessageType,
+    PromptQueuedPayload,
+    PromptSubmitPayload,
+    RunCancelPayload,
+    RunDeltaEventPayload,
+    RunDeltaTextPayload,
+    RunDeltaThinkingPayload,
+    RunDonePayload,
+    RunStartedPayload,
+    RunUsagePayload,
+    StopReason,
+    ThreadSnapshotRequestPayload,
+    ThreadSnapshotResponsePayload,
+    generate_ulid,
+)
+
+ENVELOPE_ID = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+RUN_ID = "01ARZ3NDEKTSV4RRFFQ69G5FAW"
+PROMPT_ID = "01ARZ3NDEKTSV4RRFFQ69G5FAX"
+SECOND_ID = "01ARZ3NDEKTSV4RRFFQ69G5FAY"
 
 
 def valid_envelope() -> dict[str, object]:
     return {
         "v": 1,
-        "id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "id": ENVELOPE_ID,
         "ts": "2026-07-17T12:00:00Z",
         "machine_id": "machine-1",
         "agent_id": "agent-1",
@@ -19,24 +46,41 @@ def valid_envelope() -> dict[str, object]:
     }
 
 
-def test_valid_c7_envelope() -> None:
+def envelope_for(message_type: str, payload: object) -> Envelope:
+    return Envelope.model_validate({**valid_envelope(), "type": message_type, "payload": payload})
+
+
+def test_valid_c7_envelope_has_named_type_and_typed_payload() -> None:
     envelope = Envelope.model_validate(valid_envelope())
 
     assert envelope.v == 1
     assert envelope.type is MessageType.PROMPT_SUBMIT
+    assert isinstance(envelope.payload, PromptSubmitPayload)
+    assert envelope.payload.prompt == "hello"
     assert isinstance(envelope.ts, datetime)
 
 
-def test_message_type_set_is_exactly_c7() -> None:
+def test_message_types_cover_m1_and_reserved_names() -> None:
     assert {message_type.value for message_type in MessageType} == {
         "thread.create",
+        "thread.snapshot",
         "prompt.submit",
+        "prompt.queued",
         "gate.open",
         "gate.commit",
+        "gate.dismiss",
+        "run.started",
+        "run.cancel",
         "run.delta",
+        "run.usage",
         "run.done",
         "memory.panel.update",
         "error",
+        "run.steer",
+        "plan.update",
+        "checkpoint.created",
+        "checkpoint.restore",
+        "presence.update",
     }
 
 
@@ -47,10 +91,12 @@ def test_message_type_set_is_exactly_c7() -> None:
         ("v", True),
         ("id", "not-a-ulid"),
         ("id", "81ARZ3NDEKTSV4RRFFQ69G5FAV"),
-        ("type", "relay.connect"),
+        ("type", ""),
+        ("type", " \t\n"),
+        ("type", 3),
     ],
 )
-def test_rejects_values_outside_c7(field: str, value: object) -> None:
+def test_rejects_invalid_outer_values(field: str, value: object) -> None:
     raw = valid_envelope()
     raw[field] = value
 
@@ -58,7 +104,7 @@ def test_rejects_values_outside_c7(field: str, value: object) -> None:
         Envelope.model_validate(raw)
 
 
-def test_rejects_extra_fields() -> None:
+def test_rejects_extra_outer_fields() -> None:
     raw = valid_envelope()
     raw["localhost"] = True
 
@@ -67,7 +113,7 @@ def test_rejects_extra_fields() -> None:
 
 
 @pytest.mark.parametrize("field", ["v", "id", "ts", "machine_id", "type", "payload"])
-def test_rejects_missing_required_fields(field: str) -> None:
+def test_rejects_missing_required_outer_fields(field: str) -> None:
     raw = valid_envelope()
     del raw[field]
 
@@ -75,12 +121,310 @@ def test_rejects_missing_required_fields(field: str) -> None:
         Envelope.model_validate(raw)
 
 
-def test_optional_agent_and_thread_ids_may_be_absent() -> None:
+def test_optional_agent_and_thread_ids_may_be_absent_for_untyped_extension() -> None:
     raw = valid_envelope()
     del raw["agent_id"]
     del raw["thread_id"]
+    raw["type"] = "relay.extension"
 
     envelope = Envelope.model_validate(raw)
 
     assert envelope.agent_id is None
     assert envelope.thread_id is None
+
+
+@pytest.mark.parametrize(
+    ("message_type", "payload", "expected_class"),
+    [
+        (
+            "run.started",
+            {"run_id": RUN_ID, "prompt_id": PROMPT_ID},
+            RunStartedPayload,
+        ),
+        ("run.cancel", {"run_id": RUN_ID}, RunCancelPayload),
+        (
+            "prompt.queued",
+            {"run_id": RUN_ID, "prompt_id": PROMPT_ID},
+            PromptQueuedPayload,
+        ),
+        (
+            "run.usage",
+            {
+                "run_id": RUN_ID,
+                "requests": 1,
+                "input_tokens": 2,
+                "output_tokens": 3,
+            },
+            RunUsagePayload,
+        ),
+        ("gate.open", {"run_id": RUN_ID, "kind": "memory_gate"}, GateOpenPayload),
+        ("gate.commit", {"run_id": RUN_ID}, GateCommitPayload),
+        ("gate.dismiss", {"run_id": RUN_ID}, GateDismissPayload),
+    ],
+)
+def test_known_minimum_payloads_are_typed(
+    message_type: str,
+    payload: dict[str, object],
+    expected_class: type[object],
+) -> None:
+    envelope = envelope_for(message_type, payload)
+
+    assert isinstance(envelope.payload, expected_class)
+    assert envelope.model_dump(mode="json")["payload"] == payload
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_class"),
+    [
+        (
+            {"run_id": RUN_ID, "kind": "text", "text": "answer"},
+            RunDeltaTextPayload,
+        ),
+        (
+            {"run_id": RUN_ID, "kind": "thinking", "text": "reasoning"},
+            RunDeltaThinkingPayload,
+        ),
+        (
+            {"run_id": RUN_ID, "kind": "event", "event": {"name": "tool", "ok": True}},
+            RunDeltaEventPayload,
+        ),
+    ],
+)
+def test_run_delta_is_discriminated(
+    payload: dict[str, object], expected_class: type[object]
+) -> None:
+    envelope = envelope_for("run.delta", payload)
+
+    assert isinstance(envelope.payload, expected_class)
+    assert envelope.model_dump(mode="json")["payload"] == payload
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"run_id": RUN_ID, "kind": "unknown", "text": "x"},
+        {"run_id": RUN_ID, "kind": "text"},
+        {"run_id": RUN_ID, "kind": "event", "event": ["not", "an", "object"]},
+    ],
+)
+def test_run_delta_rejects_wrong_variant_shape(payload: object) -> None:
+    with pytest.raises(ValidationError):
+        envelope_for("run.delta", payload)
+
+
+@pytest.mark.parametrize("value", [-1, True, 1.5, "1"])
+def test_run_usage_requires_strict_nonnegative_integers(value: object) -> None:
+    with pytest.raises(ValidationError):
+        envelope_for(
+            "run.usage",
+            {
+                "run_id": RUN_ID,
+                "requests": value,
+                "input_tokens": 0,
+                "output_tokens": 0,
+            },
+        )
+
+
+@pytest.mark.parametrize(
+    ("stop_reason", "partial"),
+    [
+        ("end_turn", False),
+        ("cancelled", True),
+        ("error", True),
+        ("budget_exceeded", True),
+    ],
+)
+def test_run_done_enforces_stop_reason_partial_invariant(stop_reason: str, partial: bool) -> None:
+    envelope = envelope_for(
+        "run.done",
+        {"run_id": RUN_ID, "stop_reason": stop_reason, "partial": partial},
+    )
+
+    assert isinstance(envelope.payload, RunDonePayload)
+    assert envelope.payload.stop_reason is StopReason(stop_reason)
+
+    with pytest.raises(ValidationError):
+        envelope_for(
+            "run.done",
+            {"run_id": RUN_ID, "stop_reason": stop_reason, "partial": not partial},
+        )
+
+
+def test_prompt_submit_requires_nonblank_prompt_and_outer_thread() -> None:
+    for prompt in ("", "  \n"):
+        with pytest.raises(ValidationError):
+            envelope_for("prompt.submit", {"prompt": prompt})
+
+    for thread_id in (None, " \t"):
+        raw = {**valid_envelope(), "thread_id": thread_id}
+        with pytest.raises(ValidationError):
+            Envelope.model_validate(raw)
+
+
+def test_thread_snapshot_request_requires_outer_thread() -> None:
+    request = envelope_for("thread.snapshot", {"request": True})
+    assert isinstance(request.payload, ThreadSnapshotRequestPayload)
+
+    raw = {
+        **valid_envelope(),
+        "thread_id": None,
+        "type": "thread.snapshot",
+        "payload": {"request": True},
+    }
+    with pytest.raises(ValidationError):
+        Envelope.model_validate(raw)
+
+
+def test_thread_snapshot_request_extensions_cannot_reclassify_its_direction() -> None:
+    request = envelope_for(
+        "thread.snapshot",
+        {
+            "request": True,
+            "messages": [],
+            "open_gate": None,
+            "active_run": None,
+        },
+    )
+
+    assert isinstance(request.payload, ThreadSnapshotRequestPayload)
+
+
+def test_thread_snapshot_response_types_nested_authoritative_state() -> None:
+    payload = {
+        "messages": [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "par", "partial": True},
+        ],
+        "open_gate": {
+            "run_id": RUN_ID,
+            "kind": "memory_gate",
+            "injection_id": "injection-1",
+        },
+        "active_run": {
+            "run_id": RUN_ID,
+            "prompt_id": PROMPT_ID,
+            "state": "waiting_gate",
+            "usage": {"requests": 1, "input_tokens": 2, "output_tokens": 3},
+            "queued": [{"run_id": SECOND_ID, "prompt_id": ENVELOPE_ID, "prompt": "next"}],
+        },
+        "revision": 7,
+    }
+
+    snapshot = envelope_for("thread.snapshot", payload)
+
+    assert isinstance(snapshot.payload, ThreadSnapshotResponsePayload)
+    assert isinstance(snapshot.payload.open_gate, GateOpenPayload)
+    assert isinstance(snapshot.payload.active_run, ActiveRunSnapshot)
+    assert snapshot.model_dump(mode="json")["payload"] == payload
+
+
+@pytest.mark.parametrize(
+    "message_type",
+    ["run.steer", "plan.update", "checkpoint.restore", "relay.connect"],
+)
+def test_reserved_and_unknown_types_preserve_arbitrary_json(message_type: str) -> None:
+    payload = {"future": [1, "two", True, None], "nested": {"ok": False}}
+    envelope = envelope_for(message_type, payload)
+
+    expected_type = (
+        MessageType(message_type)
+        if message_type in MessageType._value2member_map_
+        else message_type
+    )
+    assert envelope.type == expected_type
+    assert envelope.payload == payload
+    assert envelope.model_dump(mode="json")["payload"] == payload
+
+
+def test_unknown_type_rejects_non_json_python_payload() -> None:
+    with pytest.raises(ValidationError):
+        envelope_for("relay.connect", {"at": datetime.now(UTC)})
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_unknown_and_extensible_known_payloads_reject_nonfinite_numbers(
+    value: float,
+) -> None:
+    with pytest.raises(ValidationError):
+        envelope_for("relay.connect", {"value": value})
+    with pytest.raises(ValidationError):
+        envelope_for(
+            "run.delta",
+            {"run_id": RUN_ID, "kind": "event", "event": {"value": value}},
+        )
+    with pytest.raises(ValidationError):
+        envelope_for(
+            "gate.open",
+            {"run_id": RUN_ID, "kind": "memory_gate", "weight": value},
+        )
+
+
+def test_minimum_payload_extensions_are_json_typed_and_preserved() -> None:
+    payload = {
+        "run_id": RUN_ID,
+        "kind": "memory_gate",
+        "candidate_ids": ["a", "b"],
+        "details": {"count": 2},
+    }
+    envelope = envelope_for("gate.open", payload)
+
+    assert envelope.model_dump(mode="json")["payload"] == payload
+
+    with pytest.raises(ValidationError):
+        envelope_for(
+            "gate.open",
+            {"run_id": RUN_ID, "kind": "memory_gate", "at": datetime.now(UTC)},
+        )
+
+
+def test_factory_injects_fresh_ids_timestamps_and_daemon_metadata() -> None:
+    ids: Iterator[str] = iter((ENVELOPE_ID, SECOND_ID))
+    times: Iterator[datetime] = iter(
+        (
+            datetime(2026, 7, 20, 12, tzinfo=UTC),
+            datetime(2026, 7, 20, 12, 0, 1, tzinfo=UTC),
+        )
+    )
+    factory = EnvelopeFactory(
+        machine_id="daemon-1",
+        agent_id="agent-1",
+        id_factory=lambda: next(ids),
+        clock=lambda: next(times),
+    )
+
+    first = factory.create(
+        MessageType.RUN_STARTED,
+        RunStartedPayload(run_id=RUN_ID, prompt_id=PROMPT_ID),
+        thread_id="thread-1",
+    )
+    second = factory.create("relay.extension", {"ok": True}, thread_id="thread-1")
+
+    assert (first.id, second.id) == (ENVELOPE_ID, SECOND_ID)
+    assert first.ts == datetime(2026, 7, 20, 12, tzinfo=UTC)
+    assert second.ts == datetime(2026, 7, 20, 12, 0, 1, tzinfo=UTC)
+    assert first.machine_id == second.machine_id == "daemon-1"
+    assert first.agent_id == second.agent_id == "agent-1"
+    assert isinstance(first.payload, RunStartedPayload)
+
+
+def test_factory_and_generator_emit_valid_ulids() -> None:
+    generated = generate_ulid(datetime(2026, 7, 20, tzinfo=UTC))
+    factory = EnvelopeFactory(machine_id="daemon-1", id_factory=lambda: generated)
+
+    assert factory.new_id() == generated
+    assert len(generated) == 26
+    Envelope.model_validate(
+        {
+            **valid_envelope(),
+            "id": generated,
+            "type": "relay.extension",
+        }
+    )
+
+
+def test_factory_rejects_invalid_injected_id() -> None:
+    factory = EnvelopeFactory(machine_id="daemon-1", id_factory=lambda: "bad")
+
+    with pytest.raises(ValueError, match="ULID"):
+        factory.new_id()

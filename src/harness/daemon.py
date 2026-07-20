@@ -1,41 +1,76 @@
 """FastAPI daemon: built static shell plus the routed C.7 WebSocket seam."""
 
 import argparse
+import asyncio
 import json
 import subprocess
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from contextlib import suppress
 from pathlib import Path
+from uuid import UUID
 
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, status
 from fastapi.responses import PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
-from harness.envelope import Envelope, MessageType
+from harness.agent import HarnessAgent
+from harness.agent_runtime import PydanticAITurnRunner
+from harness.config import HarnessSettings
+from harness.envelope import (
+    Envelope,
+    EnvelopeFactory,
+    MessageType,
+    PromptSubmitPayload,
+    RunCancelPayload,
+    StopReason,
+    ThreadSnapshotRequestPayload,
+)
+from harness.run_loop import RunLoop
+from harness.run_protocol import RunEmitter, TurnOutcome, UsageSnapshot
+from harness.spine_client import SpineClient
+from harness.tools_memory import MemoryToolContext
 
 DEFAULT_WEB_DIST = Path(__file__).resolve().parents[2] / "web" / "dist"
 DEFAULT_WEB_ROOT = DEFAULT_WEB_DIST.parent
 
 type EnvelopeSender = Callable[[Envelope], Awaitable[None]]
 type EnvelopeHandler = Callable[[Envelope, EnvelopeSender], Awaitable[None]]
+type EnvelopeForwarder = Callable[[Envelope], Awaitable[None]]
+
+_OUTBOX_BUFFER_SIZE = 256
+_RESERVED_TYPES = frozenset(
+    {
+        MessageType.RUN_STEER,
+        MessageType.PLAN_UPDATE,
+        MessageType.CHECKPOINT_CREATED,
+        MessageType.CHECKPOINT_RESTORE,
+        MessageType.PRESENCE_UPDATE,
+    }
+)
 
 
 class _InvalidEnvelope(ValueError):
     """An inbound frame that cannot represent one C.7 envelope."""
 
 
-def _not_implemented_echo(message: Envelope) -> Envelope:
-    """Preserve the P0 fallback until a later packet supplies behavior."""
-    return message.model_copy(
-        update={
-            "type": MessageType.ERROR,
-            "payload": "not implemented",
-        }
-    )
+class _UnavailableTurnRunner:
+    """Honest default until composition supplies trusted run dependencies."""
 
-
-async def _not_implemented_route(message: Envelope, send: EnvelopeSender) -> None:
-    await send(_not_implemented_echo(message))
+    async def run(
+        self,
+        *,
+        thread_id: str,
+        prompt: str,
+        message_history: Sequence[object],
+        emit: RunEmitter,
+    ) -> TurnOutcome:
+        del thread_id, prompt, emit
+        return TurnOutcome(
+            stop_reason=StopReason.ERROR,
+            message_history=tuple(message_history),
+            usage=UsageSnapshot(),
+        )
 
 
 def _reject_json_constant(value: str) -> None:
@@ -48,6 +83,17 @@ def _parse_envelope(raw: str) -> Envelope:
         return Envelope.model_validate(decoded)
     except (ValueError, RecursionError) as exc:
         raise _InvalidEnvelope from exc
+
+
+def _serialize_envelope(message: Envelope) -> dict[str, object]:
+    """Omit optional outer IDs without dropping required null payload members."""
+
+    wire = message.model_dump(mode="json")
+    if message.agent_id is None:
+        wire.pop("agent_id")
+    if message.thread_id is None:
+        wire.pop("thread_id")
+    return wire
 
 
 async def _receive_envelope(websocket: WebSocket) -> Envelope | None:
@@ -64,26 +110,52 @@ def create_app(
     web_dist: str | Path | None = None,
     *,
     routes: Mapping[MessageType, EnvelopeHandler] | None = None,
+    run_loop: RunLoop | None = None,
+    forward_unknown: EnvelopeForwarder | None = None,
+    envelope_factory: EnvelopeFactory | None = None,
 ) -> FastAPI:
-    """Create the daemon with a copied, closed C.7 message route table."""
+    """Create the daemon with process-scoped H7 state and extensible routing."""
     app = FastAPI(title="Harness", version="0.0.0")
-    route_table: dict[MessageType, EnvelopeHandler] = {
-        message_type: _not_implemented_route for message_type in MessageType
-    }
+    factory = envelope_factory or EnvelopeFactory(machine_id="harness-daemon")
+    loop = run_loop or RunLoop(_UnavailableTurnRunner(), factory)
+    app.router.add_event_handler("shutdown", loop.close)
+    route_table: dict[MessageType, EnvelopeHandler] = {}
     if routes is not None:
         for message_type, handler in routes.items():
             if not isinstance(message_type, MessageType):
                 raise TypeError("route keys must be MessageType values")
             route_table[message_type] = handler
 
+    async def not_implemented(message: Envelope, send: EnvelopeSender) -> None:
+        await send(
+            factory.create(
+                MessageType.ERROR,
+                "not implemented",
+                thread_id=message.thread_id,
+            )
+        )
+
     @app.websocket("/ws")
     async def websocket_endpoint(websocket: WebSocket) -> None:
         await websocket.accept()
+        outbox: asyncio.Queue[Envelope] = asyncio.Queue(maxsize=_OUTBOX_BUFFER_SIZE)
+        connected = True
 
         async def send(message: Envelope) -> None:
-            await websocket.send_json(message.model_dump(mode="json", exclude_none=True))
+            if not connected:
+                return
+            validated = Envelope.model_validate(message.model_dump(mode="python"))
+            await outbox.put(validated)
+
+        async def write_outbox() -> None:
+            while True:
+                message = await outbox.get()
+                await websocket.send_json(_serialize_envelope(message))
+
+        writer = asyncio.create_task(write_outbox())
 
         try:
+            await loop.attach(send)
             while True:
                 try:
                     message = await _receive_envelope(websocket)
@@ -95,9 +167,51 @@ def create_app(
                     return
                 if message is None:
                     return
-                await route_table[message.type](message, send)
+                if not isinstance(message.type, MessageType) or message.type in _RESERVED_TYPES:
+                    if forward_unknown is not None:
+                        await forward_unknown(message)
+                    continue
+
+                custom_route = route_table.get(message.type)
+                if custom_route is not None:
+                    await custom_route(message, send)
+                    continue
+
+                if message.type is MessageType.PROMPT_SUBMIT:
+                    assert isinstance(message.payload, PromptSubmitPayload)
+                    assert message.thread_id is not None
+                    await loop.submit(
+                        thread_id=message.thread_id,
+                        prompt_id=message.id,
+                        prompt=message.payload.prompt,
+                        sink=send,
+                    )
+                elif message.type is MessageType.RUN_CANCEL:
+                    assert isinstance(message.payload, RunCancelPayload)
+                    await loop.cancel(
+                        thread_id=(
+                            message.thread_id
+                            if message.thread_id is not None and message.thread_id.strip()
+                            else None
+                        ),
+                        run_id=message.payload.run_id,
+                        sink=send,
+                    )
+                elif message.type is MessageType.THREAD_SNAPSHOT and isinstance(
+                    message.payload, ThreadSnapshotRequestPayload
+                ):
+                    assert message.thread_id is not None
+                    await loop.request_snapshot(message.thread_id, send)
+                else:
+                    await not_implemented(message, send)
         except WebSocketDisconnect:
             return
+        finally:
+            connected = False
+            await loop.detach(send)
+            writer.cancel()
+            with suppress(asyncio.CancelledError, WebSocketDisconnect, RuntimeError):
+                await writer
 
     @app.websocket("/{path:path}")
     async def reject_unknown_websocket(websocket: WebSocket, path: str) -> None:
@@ -122,6 +236,59 @@ def create_app(
     return app
 
 
+def create_dev_app(
+    web_dist: str | Path | None = None,
+    *,
+    settings: HarnessSettings | None = None,
+    agent: HarnessAgent | None = None,
+    spine: SpineClient | None = None,
+) -> FastAPI:
+    """Compose the real H3 agent loop with trusted local M1 run context."""
+
+    configured = settings or HarnessSettings()
+    principal_id = _required_identity(configured.principal_id, "PRINCIPAL_ID")
+    machine_id = _required_identity(configured.machine_id, "MACHINE_ID")
+    agent_id = _required_identity(configured.agent_id, "AGENT_ID")
+    owned_spine = spine
+    if owned_spine is None:
+        token = configured.spine_token
+        if token is None or not token.get_secret_value().strip():
+            raise ValueError("SPINE_TOKEN is required for `harness dev`")
+        owned_spine = SpineClient(configured.spine_url, token.get_secret_value())
+    owned_agent = agent or HarnessAgent(configured)
+    factory = EnvelopeFactory(machine_id=machine_id, agent_id=agent_id)
+
+    def context_factory(thread_id: str) -> MemoryToolContext:
+        try:
+            parsed_thread_id = UUID(thread_id)
+        except ValueError as exc:
+            raise ValueError("agent thread_id must be a UUID") from exc
+        return MemoryToolContext(
+            spine=owned_spine,
+            principal_id=principal_id,
+            machine_id=machine_id,
+            agent_id=agent_id,
+            thread_id=parsed_thread_id,
+            project_key=None,
+            origin_path=None,
+        )
+
+    loop = RunLoop(PydanticAITurnRunner(owned_agent, context_factory), factory)
+    app = create_app(
+        web_dist,
+        run_loop=loop,
+        envelope_factory=factory,
+    )
+    app.router.add_event_handler("shutdown", owned_spine.aclose)
+    return app
+
+
+def _required_identity(value: str, name: str) -> str:
+    if not value.strip():
+        raise ValueError(f"{name} must not be blank")
+    return value
+
+
 def _build_web(web_root: Path = DEFAULT_WEB_ROOT) -> None:
     """Produce the built static shell that the daemon serves."""
     try:
@@ -142,7 +309,7 @@ def main() -> None:
     if args.command == "dev":
         _build_web()
         uvicorn.run(
-            "harness.daemon:create_app",
+            "harness.daemon:create_dev_app",
             factory=True,
             host="127.0.0.1",
             port=8765,

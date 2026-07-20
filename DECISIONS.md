@@ -222,3 +222,69 @@ Truncating, regenerating, auto-forcing, or silently retrying a bad label or
 non-created response could save something other than the explicit command.
 Wiring current placeholder daemon routes would pre-empt H7/H4, while adding
 prepare/gate/commit behavior would trespass on H5.
+
+## 009 — Authoritative process-local run loop [P3]
+
+**Decision.** Adopt Garden A-016 as the executable C.7 v1.12 completion. Keep
+one process-scoped `RunLoop` with independent per-thread transcript, opaque
+provider history, active run, memory-gate snapshot, and FIFO. Serialize state
+transitions under one lock, but never perform model, tool, or socket work while
+holding it. Give every connection one ordered delivery worker with a 256-event
+buffer and give its WebSocket writer a second 256-envelope outbox; a subscriber
+that cannot stay inside that wall is detached from live delivery and recovers
+from the authoritative snapshot rather than consuming unbounded daemon memory.
+Confirm snapshot delivery into the connection outbox before later direct-route
+responses, shield terminalization from finish/cancel races, and never issue a
+second task cancellation while tool cleanup is already in progress. Keep a
+small injectable envelope factory for fresh ULIDs, time, and daemon identity.
+
+**Motivation.** Connection-owned state cannot satisfy reconnect hydration or
+preserve a run through a dropped socket. A process-local scheduler is the
+smallest M1 lifetime that can make cancellation, queue boundaries, and
+snapshot-first ordering exact. Separate UI transcript and provider history
+let the browser hydrate stable JSON without coupling it to pydantic-ai message
+classes. The two bounded queues preserve event order and least-attention
+operation for healthy clients while making a stalled client a recoverable
+snapshot problem instead of a daemon-wide memory leak.
+
+**Rejected alternatives.** Replaying deltas on reconnect contradicts C.7.
+Awaiting the model in the socket reader makes cancel and queue input
+unreachable. One delivery task per event and unbounded outboxes fail under a
+non-reading client. Holding the state lock across external sends lets one dead
+socket stop every run. Cross-process persistence, queue editing, steering,
+checkpointing, and retry machinery are later-milestone behavior, not H7.
+
+## 010 — Pydantic run adapter and trusted dev composition [P3, P1.4]
+
+**Decision.** Drive ordinary turns through `Agent.run` with an event-stream
+handler, caller-owned cumulative usage, and `capture_run_messages`; translate
+text and thinking explicitly and carry every other JSON-safe pydantic event
+under C.7's event delta. On cancellation, wait for tool teardown and repair
+each unanswered regular tool call using public `ModelRequest` and
+`ToolReturnPart(outcome="interrupted")` values before returning the preserved
+history. Treat a cleanup exception as cancelled when the asyncio task still
+has a cancellation request. Let `/remember` keep its direct-service visible
+failure behavior for callers, but let the run adapter request propagation of
+label-provider and budget failures so run.done and usage stay truthful.
+
+Make `harness dev` use a separate `create_dev_app` composition: one
+lifespan-owned Spine client, one `HarnessAgent`, one `PydanticAITurnRunner`, and
+settings-owned single-user `principal_id`, `machine_id`, and `agent_id`
+defaults. Parse the C.7 thread ID as a UUID only at the trusted memory-tool
+context boundary. Keep `create_app` dependency-injectable with an honest error
+runner so transport/loop tests never require credentials or hosted calls.
+
+**Motivation.** The public event and message-capture seams preserve partial
+work across model, tool, budget, and provider exits while keeping the owned run
+protocol independent of pydantic-ai. Explicit trusted composition makes the
+H3 adapter reachable from the actual developer command without accepting
+identity from model payloads or manufacturing an authorization system. The
+separate test factory keeps all verification hermetic.
+
+**Rejected alternatives.** Serializing pydantic-ai history into snapshots
+would turn a pinned framework detail into browser law. Its private dangling-
+tool repair helper is not a stable seam. Swallowing label-agent failures makes
+budget exhaustion look like a successful turn. Model-supplied identity is an
+authority leak; global credential environment mutation and hosted test calls
+make behavior non-local; adding another provider retry layer would implement
+ADR-014's later retry scope early.
