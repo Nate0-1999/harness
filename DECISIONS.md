@@ -68,3 +68,30 @@ the current human-approved contract unambiguous to H2 and later readers.
 refused to invent contract law. Leaving its opaque-model note as the journal's
 last word would misdirect H2. Declaring a competing local completion would be
 both redundant and beyond P0 authority because v1.5 already supplies the law.
+
+## 004 — Closed-set WebSocket routing without payload invention [P3]
+
+**Decision.** Adopt Garden A-013 for inbound C.7 framing. Parse one strict JSON
+text frame at a time, reject binary, invalid, non-object, or schema-invalid
+frames with the enacted 1008 close, and dispatch each validated envelope once
+through a complete `MessageType` route table. Let the app factory copy optional
+handler overrides; each async handler receives the validated envelope and an
+envelope-only sender so it may emit zero or multiple C.7 messages. Preserve the
+P0 `error: not implemented` response as the default route for every type until
+a later packet supplies that type's behavior. Register a final WebSocket-only
+catch-all before the root static mount so unknown socket paths close cleanly
+instead of entering Starlette's HTTP-only static application.
+
+**Motivation.** The copied table avoids shared mutable connection state while
+making routing directly testable. A sender callback is the smallest transport
+shape that can carry C.7's streamed `run.delta` messages without coupling a
+handler to FastAPI or prematurely defining payloads. Exact outer validation
+keeps malformed input out of every later business handler.
+
+**Rejected alternatives.** Per-type payload models, browser-versus-daemon
+direction rules, acknowledgements, and correlation semantics are absent from
+C.7 and belong to later behavior packets. A global mutable registry would leak
+handlers across app instances and tests. Passing the raw WebSocket into
+handlers would couple business code to transport, while a one-response return
+value would make the named stream type dishonest. Swallowing handler failures
+into a new error schema would invent behavior the contract does not define.

@@ -1,25 +1,31 @@
-"""P0 FastAPI daemon: built static shell plus the literal C.7 WS seam."""
+"""FastAPI daemon: built static shell plus the routed C.7 WebSocket seam."""
 
 import argparse
 import json
 import subprocess
+from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
-from typing import Any
 
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, status
 from fastapi.responses import PlainTextResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import ValidationError
 
 from harness.envelope import Envelope, MessageType
 
 DEFAULT_WEB_DIST = Path(__file__).resolve().parents[2] / "web" / "dist"
 DEFAULT_WEB_ROOT = DEFAULT_WEB_DIST.parent
 
+type EnvelopeSender = Callable[[Envelope], Awaitable[None]]
+type EnvelopeHandler = Callable[[Envelope, EnvelopeSender], Awaitable[None]]
+
+
+class _InvalidEnvelope(ValueError):
+    """An inbound frame that cannot represent one C.7 envelope."""
+
 
 def _not_implemented_echo(message: Envelope) -> Envelope:
-    """Return the only behavior authorized by the Agent Zero charge."""
+    """Preserve the P0 fallback until a later packet supplies behavior."""
     return message.model_copy(
         update={
             "type": MessageType.ERROR,
@@ -28,29 +34,78 @@ def _not_implemented_echo(message: Envelope) -> Envelope:
     )
 
 
-def create_app(web_dist: str | Path | None = None) -> FastAPI:
-    """Create the scaffold daemon without agent or memory behavior."""
+async def _not_implemented_route(message: Envelope, send: EnvelopeSender) -> None:
+    await send(_not_implemented_echo(message))
+
+
+def _reject_json_constant(value: str) -> None:
+    raise json.JSONDecodeError("non-standard JSON constant", value, 0)
+
+
+def _parse_envelope(raw: str) -> Envelope:
+    try:
+        decoded = json.loads(raw, parse_constant=_reject_json_constant)
+        return Envelope.model_validate(decoded)
+    except (ValueError, RecursionError) as exc:
+        raise _InvalidEnvelope from exc
+
+
+async def _receive_envelope(websocket: WebSocket) -> Envelope | None:
+    event = await websocket.receive()
+    if event["type"] == "websocket.disconnect":
+        return None
+    raw = event.get("text")
+    if not isinstance(raw, str):
+        raise _InvalidEnvelope
+    return _parse_envelope(raw)
+
+
+def create_app(
+    web_dist: str | Path | None = None,
+    *,
+    routes: Mapping[MessageType, EnvelopeHandler] | None = None,
+) -> FastAPI:
+    """Create the daemon with a copied, closed C.7 message route table."""
     app = FastAPI(title="Harness", version="0.0.0")
+    route_table: dict[MessageType, EnvelopeHandler] = {
+        message_type: _not_implemented_route for message_type in MessageType
+    }
+    if routes is not None:
+        for message_type, handler in routes.items():
+            if not isinstance(message_type, MessageType):
+                raise TypeError("route keys must be MessageType values")
+            route_table[message_type] = handler
 
     @app.websocket("/ws")
     async def websocket_endpoint(websocket: WebSocket) -> None:
         await websocket.accept()
+
+        async def send(message: Envelope) -> None:
+            await websocket.send_json(message.model_dump(mode="json", exclude_none=True))
+
         try:
             while True:
                 try:
-                    raw: Any = await websocket.receive_json()
-                    message = Envelope.model_validate(raw)
-                except (json.JSONDecodeError, ValidationError):
+                    message = await _receive_envelope(websocket)
+                except _InvalidEnvelope:
                     await websocket.close(
                         code=status.WS_1008_POLICY_VIOLATION,
                         reason="invalid C.7 envelope",
                     )
                     return
-
-                response = _not_implemented_echo(message)
-                await websocket.send_json(response.model_dump(mode="json", exclude_none=True))
+                if message is None:
+                    return
+                await route_table[message.type](message, send)
         except WebSocketDisconnect:
             return
+
+    @app.websocket("/{path:path}")
+    async def reject_unknown_websocket(websocket: WebSocket, path: str) -> None:
+        await websocket.accept()
+        await websocket.close(
+            code=status.WS_1008_POLICY_VIOLATION,
+            reason="unknown WebSocket route",
+        )
 
     static_root = Path(web_dist) if web_dist is not None else DEFAULT_WEB_DIST
     if (static_root / "index.html").is_file():

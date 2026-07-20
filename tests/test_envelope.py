@@ -27,10 +27,24 @@ def test_valid_c7_envelope() -> None:
     assert isinstance(envelope.ts, datetime)
 
 
+def test_message_type_set_is_exactly_c7() -> None:
+    assert {message_type.value for message_type in MessageType} == {
+        "thread.create",
+        "prompt.submit",
+        "gate.open",
+        "gate.commit",
+        "run.delta",
+        "run.done",
+        "memory.panel.update",
+        "error",
+    }
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
         ("v", 2),
+        ("v", True),
         ("id", "not-a-ulid"),
         ("id", "81ARZ3NDEKTSV4RRFFQ69G5FAV"),
         ("type", "relay.connect"),
@@ -47,6 +61,15 @@ def test_rejects_values_outside_c7(field: str, value: object) -> None:
 def test_rejects_extra_fields() -> None:
     raw = valid_envelope()
     raw["localhost"] = True
+
+    with pytest.raises(ValidationError):
+        Envelope.model_validate(raw)
+
+
+@pytest.mark.parametrize("field", ["v", "id", "ts", "machine_id", "type", "payload"])
+def test_rejects_missing_required_fields(field: str) -> None:
+    raw = valid_envelope()
+    del raw[field]
 
     with pytest.raises(ValidationError):
         Envelope.model_validate(raw)

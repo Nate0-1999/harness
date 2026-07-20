@@ -39,6 +39,13 @@ class Envelope(BaseModel):
     type: MessageType
     payload: Any
 
+    @field_validator("v", mode="before")
+    @classmethod
+    def reject_boolean_version(cls, value: object) -> object:
+        if isinstance(value, bool):
+            raise ValueError("v must be the numeric literal 1")
+        return value
+
     @field_validator("id")
     @classmethod
     def require_ulid(cls, value: str) -> str:
