@@ -2,16 +2,27 @@
   font-family:
     Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
     sans-serif;
-  color: #f3f7f4;
-  background: #0b100e;
+  color: #f2f0e9;
+  background: #070708;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
-  --ink: #f3f7f4;
-  --muted: #9ca9a1;
-  --line: rgba(225, 238, 230, 0.13);
-  --surface: rgba(20, 29, 25, 0.82);
-  --accent: #a8f0bd;
+  --ground: #070708;
+  --surface: #0d0e10;
+  --surface-raised: #121316;
+  --ink: #f2f0e9;
+  --muted: #9ca0a6;
+  --dim: #858a92;
+  --line: #292b30;
+  --line-strong: #44474d;
+  --accent: #d97a3a;
+  --accent-soft: rgba(217, 122, 58, 0.12);
+  --danger: #e6404d;
+  --danger-soft: rgba(230, 64, 77, 0.11);
+  --display-font:
+    "Arial Narrow", "Avenir Next Condensed", "Helvetica Neue", sans-serif;
+  --data-font:
+    "JetBrains Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
 }
 
 * {
@@ -21,7 +32,7 @@
 html {
   min-width: 320px;
   min-height: 100%;
-  background: #0b100e;
+  background: var(--ground);
 }
 
 body {
@@ -29,17 +40,64 @@ body {
   min-height: 100vh;
   min-height: 100dvh;
   margin: 0;
-  overflow-x: hidden;
+  overflow: hidden;
 }
 
 button,
-input,
-textarea,
-select {
+textarea {
+  color: inherit;
   font: inherit;
+}
+
+button {
+  border: 0;
+}
+
+button:not(:disabled) {
+  cursor: pointer;
+}
+
+button:focus-visible,
+textarea:focus-visible,
+summary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+button:disabled,
+textarea:disabled {
+  cursor: not-allowed;
+  opacity: 0.44;
+}
+
+p,
+h1,
+h2 {
+  overflow-wrap: anywhere;
 }
 
 #root {
   min-height: 100vh;
   min-height: 100dvh;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+  }
 }

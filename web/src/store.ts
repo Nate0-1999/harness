@@ -1,0 +1,610 @@
+import { create } from 'zustand'
+import { persist } from 'zustand/middleware'
+
+import {
+  decodeServerEnvelope,
+  isUuid,
+  type ActiveRunSnapshot,
+  type ChatMessage,
+  type DecodedServerEvent,
+  type Envelope,
+  type GateOpenPayload,
+  type JsonValue,
+  type QueuedPrompt,
+  type RunDeltaPayload,
+  type RunDonePayload,
+  type RunStartedPayload,
+  type ThreadCatalogEntry,
+  type ThreadSnapshotPayload,
+  type Usage,
+  type Ulid,
+} from './protocol'
+
+export const THREAD_CATALOG_STORAGE_KEY = 'harness.thread-catalog.v1'
+
+export type ConnectionStatus =
+  | 'disconnected'
+  | 'connecting'
+  | 'connected'
+  | 'reconnecting'
+
+export interface ActiveRunState {
+  run_id: Ulid
+  prompt_id: Ulid
+  state: ActiveRunSnapshot['state']
+}
+
+export interface HarnessError {
+  message: string
+  detail: JsonValue
+}
+
+export interface OutboundPrompt {
+  prompt_id: Ulid
+  prompt: string
+}
+
+export interface ThreadState {
+  messages: ChatMessage[]
+  outboundPrompts: OutboundPrompt[]
+  openGate: GateOpenPayload | null
+  activeRun: ActiveRunState | null
+  usage: Usage | null
+  queuedPrompts: QueuedPrompt[]
+  lastError: HarnessError | null
+  awaitingSnapshot: boolean
+}
+
+interface PersistedHarnessState {
+  catalog: ThreadCatalogEntry[]
+  selectedThreadId: string | null
+}
+
+export interface HarnessStoreState extends PersistedHarnessState {
+  threads: Record<string, ThreadState>
+  connection: ConnectionStatus
+  daemonMachineId: string | null
+  globalError: HarnessError | null
+  createThread: () => string
+  selectThread: (threadId: string) => void
+  beginPrompt: (threadId: string, promptId: Ulid, prompt: string) => void
+  markCancelling: (threadId: string, runId: Ulid) => void
+  markSnapshotPending: (threadId: string) => void
+  observeDaemon: (machineId: string) => void
+  setConnection: (connection: ConnectionStatus) => void
+  setTransportError: (message: string) => void
+  clearError: (threadId?: string) => void
+  receiveEnvelope: (envelope: Envelope) => boolean
+}
+
+function emptyThreadState(): ThreadState {
+  return {
+    messages: [],
+    outboundPrompts: [],
+    openGate: null,
+    activeRun: null,
+    usage: null,
+    queuedPrompts: [],
+    lastError: null,
+    awaitingSnapshot: false,
+  }
+}
+
+function normalizedTitle(prompt: string): string {
+  const normalized = prompt.trim().replace(/\s+/gu, ' ')
+  const codePoints = Array.from(normalized)
+  if (codePoints.length <= 48) {
+    return normalized
+  }
+  return `${codePoints.slice(0, 48).join('')}…`
+}
+
+function nextIsoTimestamp(previous: string): string {
+  const previousTime = Date.parse(previous)
+  const nextTime = Math.max(Date.now(), previousTime + 1)
+  return new Date(nextTime).toISOString()
+}
+
+function newCatalogEntry(threadId: string): ThreadCatalogEntry {
+  const timestamp = new Date().toISOString()
+  return {
+    thread_id: threadId,
+    title: 'New thread',
+    created_at: timestamp,
+    updated_at: timestamp,
+  }
+}
+
+function errorFromPayload(payload: JsonValue): HarnessError {
+  let message = 'Harness error'
+  if (typeof payload === 'string' && payload.trim()) {
+    message = payload
+  } else if (
+    typeof payload === 'object' &&
+    payload !== null &&
+    !Array.isArray(payload) &&
+    typeof payload.code === 'string' &&
+    payload.code.trim()
+  ) {
+    message = payload.code.replaceAll('_', ' ')
+  }
+  return { message, detail: payload }
+}
+
+function replaceThread(
+  threads: Record<string, ThreadState>,
+  threadId: string,
+  update: (thread: ThreadState) => ThreadState,
+): Record<string, ThreadState> {
+  return {
+    ...threads,
+    [threadId]: update(threads[threadId] ?? emptyThreadState()),
+  }
+}
+
+function assistantForRun(runId: Ulid): Extract<ChatMessage, { role: 'assistant' }> {
+  return {
+    message_id: runId,
+    run_id: runId,
+    role: 'assistant',
+    content: '',
+    thinking: '',
+    events: [],
+    partial: true,
+  }
+}
+
+function applyStarted(thread: ThreadState, payload: RunStartedPayload): ThreadState {
+  const outbound = thread.outboundPrompts.find(
+    (prompt) => prompt.prompt_id === payload.prompt_id,
+  )
+  let foundUser = false
+  let foundAssistant = false
+  const messages = thread.messages.map((message): ChatMessage => {
+    if (message.role === 'user' && message.message_id === payload.prompt_id) {
+      foundUser = true
+      return { ...message, run_id: payload.run_id, state: 'running' }
+    }
+    if (message.role === 'assistant' && message.run_id === payload.run_id) {
+      foundAssistant = true
+    }
+    return message
+  })
+  if (!foundUser && outbound !== undefined) {
+    const userMessage: ChatMessage = {
+      message_id: payload.prompt_id,
+      run_id: payload.run_id,
+      role: 'user',
+      content: outbound.prompt,
+      state: 'running',
+    }
+    const assistantIndex = messages.findIndex(
+      (message) => message.role === 'assistant' && message.run_id === payload.run_id,
+    )
+    if (assistantIndex === -1) {
+      messages.push(userMessage)
+    } else {
+      messages.splice(assistantIndex, 0, userMessage)
+    }
+  }
+  if (!foundAssistant) {
+    messages.push(assistantForRun(payload.run_id))
+  }
+  return {
+    ...thread,
+    messages,
+    outboundPrompts: thread.outboundPrompts.filter(
+      (prompt) => prompt.prompt_id !== payload.prompt_id,
+    ),
+    activeRun: {
+      run_id: payload.run_id,
+      prompt_id: payload.prompt_id,
+      state: 'running',
+    },
+    usage: { requests: 0, input_tokens: 0, output_tokens: 0 },
+    queuedPrompts: thread.queuedPrompts.filter(
+      (prompt) =>
+        prompt.run_id !== payload.run_id && prompt.prompt_id !== payload.prompt_id,
+    ),
+    lastError: null,
+  }
+}
+
+function applyQueued(thread: ThreadState, payload: RunStartedPayload): ThreadState {
+  const outbound = thread.outboundPrompts.find(
+    (prompt) => prompt.prompt_id === payload.prompt_id,
+  )
+  let prompt = outbound?.prompt ?? ''
+  let foundUser = false
+  const messages = thread.messages.map((message): ChatMessage => {
+    if (message.role === 'user' && message.message_id === payload.prompt_id) {
+      foundUser = true
+      prompt = message.content
+      return { ...message, run_id: payload.run_id, state: 'queued' }
+    }
+    return message
+  })
+  if (!foundUser && outbound !== undefined) {
+    messages.push({
+      message_id: payload.prompt_id,
+      run_id: payload.run_id,
+      role: 'user',
+      content: outbound.prompt,
+      state: 'queued',
+    })
+  }
+  const exists = thread.queuedPrompts.some(
+    (queued) =>
+      queued.run_id === payload.run_id || queued.prompt_id === payload.prompt_id,
+  )
+  return {
+    ...thread,
+    messages,
+    outboundPrompts: thread.outboundPrompts.filter(
+      (item) => item.prompt_id !== payload.prompt_id,
+    ),
+    queuedPrompts:
+      exists || !prompt
+        ? thread.queuedPrompts
+        : [
+            ...thread.queuedPrompts,
+            {
+              run_id: payload.run_id,
+              prompt_id: payload.prompt_id,
+              prompt,
+            },
+          ],
+  }
+}
+
+function applyDelta(thread: ThreadState, payload: RunDeltaPayload): ThreadState {
+  if (thread.activeRun?.run_id !== payload.run_id) {
+    return thread
+  }
+  let found = false
+  const messages = thread.messages.map((message): ChatMessage => {
+    if (message.role !== 'assistant' || message.run_id !== payload.run_id) {
+      return message
+    }
+    found = true
+    if (payload.kind === 'text') {
+      return { ...message, content: message.content + payload.text }
+    }
+    if (payload.kind === 'thinking') {
+      return { ...message, thinking: message.thinking + payload.text }
+    }
+    return { ...message, events: [...message.events, payload.event] }
+  })
+  if (!found) {
+    const assistant = assistantForRun(payload.run_id)
+    if (payload.kind === 'text') {
+      assistant.content = payload.text
+    } else if (payload.kind === 'thinking') {
+      assistant.thinking = payload.text
+    } else {
+      assistant.events = [payload.event]
+    }
+    messages.push(assistant)
+  }
+  return { ...thread, messages }
+}
+
+function applyDone(thread: ThreadState, payload: RunDonePayload): ThreadState {
+  const messages = thread.messages.map((message): ChatMessage => {
+    if (message.run_id !== payload.run_id) {
+      return message
+    }
+    if (message.role === 'user') {
+      return { ...message, state: payload.stop_reason }
+    }
+    return { ...message, partial: payload.partial }
+  })
+  return {
+    ...thread,
+    messages,
+    activeRun:
+      thread.activeRun?.run_id === payload.run_id ? null : thread.activeRun,
+  }
+}
+
+function replaceFromSnapshot(
+  payload: ThreadSnapshotPayload,
+  previous: ThreadState,
+): ThreadState {
+  const active = payload.active_run
+  const representedPromptIds = new Set(
+    payload.messages
+      .filter((message) => message.role === 'user')
+      .map((message) => message.message_id),
+  )
+  return {
+    messages: payload.messages,
+    outboundPrompts: previous.outboundPrompts.filter(
+      (prompt) => !representedPromptIds.has(prompt.prompt_id),
+    ),
+    openGate: payload.open_gate,
+    activeRun:
+      active === null
+        ? null
+        : {
+            run_id: active.run_id,
+            prompt_id: active.prompt_id,
+            state: active.state,
+          },
+    usage: active?.usage ?? null,
+    queuedPrompts: active?.queued ?? [],
+    lastError: null,
+    awaitingSnapshot: false,
+  }
+}
+
+function applyEvent(thread: ThreadState, event: DecodedServerEvent): ThreadState {
+  switch (event.type) {
+    case 'run.started':
+      return applyStarted(thread, event.payload)
+    case 'prompt.queued':
+      return applyQueued(thread, event.payload)
+    case 'run.delta':
+      return applyDelta(thread, event.payload)
+    case 'run.usage':
+      return thread.activeRun?.run_id === event.payload.run_id
+        ? {
+            ...thread,
+            usage: {
+              requests: event.payload.requests,
+              input_tokens: event.payload.input_tokens,
+              output_tokens: event.payload.output_tokens,
+            },
+          }
+        : thread
+    case 'run.done':
+      return applyDone(thread, event.payload)
+    case 'gate.open':
+      return {
+        ...thread,
+        openGate: event.payload,
+        activeRun:
+          thread.activeRun?.run_id === event.payload.run_id
+            ? { ...thread.activeRun, state: 'waiting_gate' }
+            : thread.activeRun,
+      }
+    case 'gate.dismiss':
+      return {
+        ...thread,
+        openGate:
+          thread.openGate?.run_id === event.payload.run_id
+            ? null
+            : thread.openGate,
+      }
+    case 'error':
+      return { ...thread, lastError: errorFromPayload(event.payload) }
+    default:
+      return thread
+  }
+}
+
+function isIsoTimestamp(value: unknown): value is string {
+  return (
+    typeof value === 'string' &&
+    !Number.isNaN(Date.parse(value)) &&
+    new Date(value).toISOString() === value
+  )
+}
+
+function restoredState(value: unknown): PersistedHarnessState {
+  if (typeof value !== 'object' || value === null) {
+    return { catalog: [], selectedThreadId: null }
+  }
+  const candidate = value as Partial<PersistedHarnessState>
+  const seen = new Set<string>()
+  const catalog = Array.isArray(candidate.catalog)
+    ? candidate.catalog.filter((entry): entry is ThreadCatalogEntry => {
+        if (
+          typeof entry !== 'object' ||
+          entry === null ||
+          !isUuid(entry.thread_id) ||
+          seen.has(entry.thread_id) ||
+          typeof entry.title !== 'string' ||
+          !isIsoTimestamp(entry.created_at) ||
+          !isIsoTimestamp(entry.updated_at)
+        ) {
+          return false
+        }
+        seen.add(entry.thread_id)
+        return true
+      })
+    : []
+  const selectedThreadId =
+    typeof candidate.selectedThreadId === 'string' &&
+    seen.has(candidate.selectedThreadId)
+      ? candidate.selectedThreadId
+      : null
+  return { catalog, selectedThreadId }
+}
+
+function runtimeForCatalog(catalog: ThreadCatalogEntry[]): Record<string, ThreadState> {
+  return Object.fromEntries(
+    catalog.map((entry) => [
+      entry.thread_id,
+      { ...emptyThreadState(), awaitingSnapshot: true },
+    ]),
+  )
+}
+
+export const useHarnessStore = create<HarnessStoreState>()(
+  persist<HarnessStoreState, [], [], PersistedHarnessState>(
+    (set, get) => ({
+      catalog: [],
+      selectedThreadId: null,
+      threads: {},
+      connection: 'disconnected',
+      daemonMachineId: null,
+      globalError: null,
+
+      createThread: () => {
+        let threadId = globalThis.crypto.randomUUID()
+        while (get().catalog.some((entry) => entry.thread_id === threadId)) {
+          threadId = globalThis.crypto.randomUUID()
+        }
+        const entry = newCatalogEntry(threadId)
+        set((state) => ({
+          catalog: [...state.catalog, entry],
+          selectedThreadId: threadId,
+          threads: {
+            ...state.threads,
+            [threadId]: emptyThreadState(),
+          },
+          globalError: null,
+        }))
+        return threadId
+      },
+
+      selectThread: (threadId) => {
+        if (!get().catalog.some((entry) => entry.thread_id === threadId)) {
+          throw new RangeError('thread is not in the local catalog')
+        }
+        set((state) => ({
+          selectedThreadId: threadId,
+          threads: state.threads[threadId]
+            ? state.threads
+            : { ...state.threads, [threadId]: emptyThreadState() },
+          globalError: null,
+        }))
+      },
+
+      beginPrompt: (threadId, promptId, prompt) => {
+        const title = normalizedTitle(prompt)
+        if (!title) {
+          throw new TypeError('prompt must not be blank')
+        }
+        set((state) => ({
+          catalog: state.catalog.map((entry) => {
+            if (entry.thread_id !== threadId) {
+              return entry
+            }
+            const firstPrompt = entry.created_at === entry.updated_at
+            return {
+              ...entry,
+              title: firstPrompt ? title : entry.title,
+              updated_at: nextIsoTimestamp(entry.updated_at),
+            }
+          }),
+          threads: replaceThread(state.threads, threadId, (thread) => ({
+            ...thread,
+            outboundPrompts: [
+              ...thread.outboundPrompts.filter(
+                (outbound) => outbound.prompt_id !== promptId,
+              ),
+              { prompt_id: promptId, prompt },
+            ],
+            lastError: null,
+          })),
+        }))
+      },
+
+      markCancelling: (threadId, runId) => {
+        set((state) => ({
+          threads: replaceThread(state.threads, threadId, (thread) => ({
+            ...thread,
+            activeRun:
+              thread.activeRun?.run_id === runId
+                ? { ...thread.activeRun, state: 'cancelling' }
+                : thread.activeRun,
+          })),
+        }))
+      },
+
+      markSnapshotPending: (threadId) => {
+        set((state) => ({
+          threads: replaceThread(state.threads, threadId, (thread) => ({
+            ...thread,
+            awaitingSnapshot: true,
+          })),
+        }))
+      },
+
+      observeDaemon: (machineId) => {
+        if (machineId.trim()) {
+          set({ daemonMachineId: machineId })
+        }
+      },
+
+      setConnection: (connection) => set({ connection }),
+
+      setTransportError: (message) => {
+        set({
+          globalError: { message, detail: message },
+        })
+      },
+
+      clearError: (threadId) => {
+        if (threadId === undefined) {
+          set({ globalError: null })
+          return
+        }
+        set((state) => ({
+          threads: replaceThread(state.threads, threadId, (thread) => ({
+            ...thread,
+            lastError: null,
+          })),
+        }))
+      },
+
+      receiveEnvelope: (envelope) => {
+        get().observeDaemon(envelope.machine_id)
+        const event = decodeServerEnvelope(envelope)
+        if (event === null || event.type === 'unknown') {
+          return false
+        }
+
+        const selectedThreadId = get().selectedThreadId
+        if (event.type === 'error' && envelope.thread_id === undefined) {
+          set({ globalError: errorFromPayload(event.payload) })
+          return false
+        }
+        if (
+          selectedThreadId === null ||
+          envelope.thread_id !== selectedThreadId
+        ) {
+          return false
+        }
+
+        if (event.type === 'thread.snapshot') {
+          set((state) => ({
+            threads: {
+              ...state.threads,
+              [selectedThreadId]: replaceFromSnapshot(
+                event.payload,
+                state.threads[selectedThreadId] ?? emptyThreadState(),
+              ),
+            },
+            globalError: null,
+          }))
+          return true
+        }
+
+        set((state) => ({
+          threads: replaceThread(state.threads, selectedThreadId, (thread) =>
+            applyEvent(thread, event),
+          ),
+        }))
+        return false
+      },
+    }),
+    {
+      name: THREAD_CATALOG_STORAGE_KEY,
+      partialize: (state) => ({
+        catalog: state.catalog,
+        selectedThreadId: state.selectedThreadId,
+      }),
+      merge: (persisted, current) => {
+        const restored = restoredState(persisted)
+        return {
+          ...current,
+          ...restored,
+          threads: runtimeForCatalog(restored.catalog),
+        }
+      },
+    },
+  ),
+)

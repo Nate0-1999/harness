@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 import pytest
@@ -114,6 +114,24 @@ def app_with_runner(runner: CancellableRunner, tmp_path: Path):
         run_loop=RunLoop(runner, factory),
         envelope_factory=factory,
     )
+
+
+class OverflowOnAttachLoop:
+    async def attach(
+        self,
+        sink: EnvelopeSender,
+        *,
+        on_overflow: Callable[[], None] | None = None,
+    ) -> None:
+        del sink
+        assert on_overflow is not None
+        on_overflow()
+
+    async def detach(self, sink: EnvelopeSender) -> None:
+        del sink
+
+    async def close(self) -> None:
+        pass
 
 
 def test_serves_built_web_static(tmp_path: Path) -> None:
@@ -290,6 +308,56 @@ def test_ws_handler_may_stream_multiple_valid_envelopes(tmp_path: Path) -> None:
         websocket.send_json(valid_envelope())
         assert websocket.receive_json()["payload"] == {"index": 0}
         assert websocket.receive_json()["payload"] == {"index": 1}
+
+
+def test_ws_live_subscription_overflow_closes_for_snapshot_resync(tmp_path: Path) -> None:
+    client = TestClient(create_app(tmp_path, run_loop=OverflowOnAttachLoop()))  # type: ignore[arg-type]
+
+    with client.websocket_connect("/ws") as websocket:
+        with pytest.raises(WebSocketDisconnect) as caught:
+            websocket.receive_json()
+
+    assert caught.value.code == 1013
+    assert caught.value.reason == "snapshot resync required"
+
+
+def test_ws_outbox_overflow_closes_for_snapshot_resync(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def block_json_send(self, data, mode: str = "text") -> None:
+        del self, data, mode
+        await asyncio.Future()
+
+    factory = EnvelopeFactory(machine_id="daemon-test")
+
+    async def overflow(message: Envelope, send: EnvelopeSender) -> None:
+        for index in range(4):
+            await send(
+                factory.create(
+                    MessageType.ERROR,
+                    {"index": index},
+                    thread_id=message.thread_id,
+                )
+            )
+
+    monkeypatch.setattr("harness.daemon._OUTBOX_BUFFER_SIZE", 2)
+    monkeypatch.setattr("starlette.websockets.WebSocket.send_json", block_json_send)
+    client = TestClient(
+        create_app(
+            tmp_path,
+            routes={MessageType.PROMPT_SUBMIT: overflow},
+            envelope_factory=factory,
+        )
+    )
+
+    with client.websocket_connect("/ws") as websocket:
+        websocket.send_json(valid_envelope())
+        with pytest.raises(WebSocketDisconnect) as caught:
+            websocket.receive_json()
+
+    assert caught.value.code == 1013
+    assert caught.value.reason == "snapshot resync required"
 
 
 def test_ws_cancel_midstream_confirms_and_preserves_partial_work(tmp_path: Path) -> None:

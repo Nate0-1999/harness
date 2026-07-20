@@ -343,7 +343,19 @@ async def test_slow_sink_is_bounded_without_one_task_per_delta() -> None:
     runner = ControlledRunner({"hello": control})
     loop = RunLoop(runner, factory(ids))
     sink = BlockingSink()
-    await loop.attach(sink)
+    overflow_count = 0
+
+    def record_overflow() -> None:
+        nonlocal overflow_count
+        overflow_count += 1
+
+    await loop.attach(sink, on_overflow=record_overflow)
+    # H4 selects its local thread immediately after connecting. The overflow
+    # callback must survive that authoritative snapshot re-subscription.
+    sink.release.set()
+    await loop.request_snapshot("thread-1", sink)
+    sink.release.clear()
+    sink.entered.clear()
     await loop.submit(
         thread_id="thread-1",
         prompt_id=ulid(1),
@@ -364,8 +376,9 @@ async def test_slow_sink_is_bounded_without_one_task_per_delta() -> None:
         if task.get_name() == "harness-envelope-delivery" and not task.done()
     ]
     assert len(delivery_tasks) <= 1
-    assert sink.calls == 1
+    assert sink.calls == 2
     assert loop._subscriptions == []
+    assert overflow_count == 1
 
     control.release.set()
     for _ in range(100):

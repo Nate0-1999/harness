@@ -67,6 +67,7 @@ class _ThreadState:
 class _Subscription:
     sink: EnvelopeSink
     thread_id: str | None
+    on_overflow: Callable[[], None] | None = None
     queue: asyncio.Queue[_Delivery] = field(
         default_factory=lambda: asyncio.Queue(maxsize=_SUBSCRIPTION_BUFFER_SIZE)
     )
@@ -121,7 +122,12 @@ class RunLoop:
         self._terminal_tasks: set[asyncio.Task[None]] = set()
         self._closing = False
 
-    async def attach(self, sink: EnvelopeSink) -> None:
+    async def attach(
+        self,
+        sink: EnvelopeSink,
+        *,
+        on_overflow: Callable[[], None] | None = None,
+    ) -> None:
         """Attach a connection and snapshot the selected thread before events."""
 
         receipt: asyncio.Future[None] | None = None
@@ -129,7 +135,11 @@ class RunLoop:
             self._require_open()
             self._remove_sink_locked(sink)
             thread_id = self._selected_thread_id
-            subscription = _Subscription(sink=sink, thread_id=thread_id)
+            subscription = _Subscription(
+                sink=sink,
+                thread_id=thread_id,
+                on_overflow=on_overflow,
+            )
             self._subscriptions.append(subscription)
             if thread_id is not None:
                 state = self._threads.setdefault(thread_id, _ThreadState())
@@ -160,8 +170,14 @@ class RunLoop:
             self._require_open()
             state = self._threads.setdefault(thread_id, _ThreadState())
             self._selected_thread_id = thread_id
+            existing = self._find_sink_locked(sink)
+            on_overflow = existing.on_overflow if existing is not None else None
             self._remove_sink_locked(sink)
-            subscription = _Subscription(sink=sink, thread_id=thread_id)
+            subscription = _Subscription(
+                sink=sink,
+                thread_id=thread_id,
+                on_overflow=on_overflow,
+            )
             self._subscriptions.append(subscription)
             pending = self._enqueue_locked(
                 subscription,
@@ -661,6 +677,13 @@ class RunLoop:
             self._subscriptions = [
                 candidate for candidate in self._subscriptions if candidate is not subscription
             ]
+            if subscription.on_overflow is not None:
+                try:
+                    subscription.on_overflow()
+                except Exception:
+                    # Overflow notification is a connection-lifecycle signal;
+                    # a faulty observer must not interrupt the authoritative run.
+                    pass
             if confirm:
                 raise ConnectionError("envelope subscription exceeded its buffer") from None
             return None

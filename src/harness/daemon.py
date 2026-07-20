@@ -39,6 +39,7 @@ type EnvelopeHandler = Callable[[Envelope, EnvelopeSender], Awaitable[None]]
 type EnvelopeForwarder = Callable[[Envelope], Awaitable[None]]
 
 _OUTBOX_BUFFER_SIZE = 256
+_RESYNC_CLOSE_REASON = "snapshot resync required"
 _RESERVED_TYPES = frozenset(
     {
         MessageType.RUN_STEER,
@@ -139,23 +140,44 @@ def create_app(
     async def websocket_endpoint(websocket: WebSocket) -> None:
         await websocket.accept()
         outbox: asyncio.Queue[Envelope] = asyncio.Queue(maxsize=_OUTBOX_BUFFER_SIZE)
+        resync_required = asyncio.Event()
         connected = True
 
         async def send(message: Envelope) -> None:
-            if not connected:
+            if not connected or resync_required.is_set():
                 return
             validated = Envelope.model_validate(message.model_dump(mode="python"))
-            await outbox.put(validated)
+            try:
+                outbox.put_nowait(validated)
+            except asyncio.QueueFull:
+                resync_required.set()
 
         async def write_outbox() -> None:
             while True:
                 message = await outbox.get()
-                await websocket.send_json(_serialize_envelope(message))
+                try:
+                    await websocket.send_json(_serialize_envelope(message))
+                finally:
+                    outbox.task_done()
 
         writer = asyncio.create_task(write_outbox())
 
+        async def close_for_resync() -> None:
+            await resync_required.wait()
+            writer.cancel()
+            with suppress(asyncio.CancelledError, WebSocketDisconnect, RuntimeError):
+                await writer
+            if connected:
+                with suppress(WebSocketDisconnect, RuntimeError):
+                    await websocket.close(
+                        code=status.WS_1013_TRY_AGAIN_LATER,
+                        reason=_RESYNC_CLOSE_REASON,
+                    )
+
+        resync_closer = asyncio.create_task(close_for_resync())
+
         try:
-            await loop.attach(send)
+            await loop.attach(send, on_overflow=resync_required.set)
             while True:
                 try:
                     message = await _receive_envelope(websocket)
@@ -210,8 +232,11 @@ def create_app(
             connected = False
             await loop.detach(send)
             writer.cancel()
+            resync_closer.cancel()
             with suppress(asyncio.CancelledError, WebSocketDisconnect, RuntimeError):
                 await writer
+            with suppress(asyncio.CancelledError, WebSocketDisconnect, RuntimeError):
+                await resync_closer
 
     @app.websocket("/{path:path}")
     async def reject_unknown_websocket(websocket: WebSocket, path: str) -> None:

@@ -288,3 +288,37 @@ budget exhaustion look like a successful turn. Model-supplied identity is an
 authority leak; global credential environment mutation and hosted test calls
 make behavior non-local; adding another provider retry layer would implement
 ADR-014's later retry scope early.
+
+## 011 — Snapshot-first direct chat shell [P2, P3]
+
+**Decision.** Adopt Garden A-017 and A-018 with one Zustand store, one
+same-origin WebSocket owner, and no client router. Persist only the browser's
+local UUID thread catalog; replace transcript, active run, gate, and usage from
+each matching daemon snapshot. Keep successfully sent but unacknowledged
+prompts in a volatile overlay so an overlapping attach/request snapshot cannot
+erase their only text copy. Recover bounded-delivery close 1013 by reconnecting
+and requesting the selected snapshot, never by replay or polling.
+
+Use a restrained near-black, warm-white, steel, and orange two-pane shell on
+wide screens and a single-pane thread view at 390×844. Preserve quiet
+full-width message rows, explicit queue/stop/usage states, reader-controlled
+scroll position, 44px controls, and coral only for errors. Do not render the
+future memory gate, Memory panel, Cube, decorative cosmos, or placeholder
+controls. NATES_VISION §8 names self-hosted Inter, JetBrains Mono, and extended
+display faces, but this checkout contains no licensed font assets. H4 therefore
+uses explicit system/local fallbacks rather than adding a network font request
+or fabricating font files; adopting committed licensed assets is deferred to a
+packet that actually supplies them.
+
+**Motivation.** Snapshot authority and a separate pre-ack overlay make reload,
+queue, cancellation, and backpressure behavior coherent without inventing a
+server thread-list API. The visual choices keep attention on the conversation,
+remain readable and keyboard-operable on the required phone viewport, and
+follow the vision's hierarchy and palette with no external runtime dependency.
+
+**Rejected alternatives.** Server-side thread enumeration/persistence, client
+replay buffers, polling, route machinery, a component framework, and another
+state store add behavior H4 does not need. A font CDN makes the local shell
+network-dependent, while fake bundled font files would be dishonest evidence.
+Prebuilding H5/H6 surfaces or ornamental scaffolding would violate the M1 scope
+fence and least-attention invariant.
