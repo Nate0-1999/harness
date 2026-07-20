@@ -133,3 +133,92 @@ bearer token outside the configured service. Calling OpenAI or the deployed
 cloud service would make routine verification depend on credentials, quota,
 cost, and mutable external state; adding a fake provider to Spine production
 would widen that repository solely for this packet.
+
+## 006 — Owned H3 capability seam at the first real use [P1.2]
+
+**Decision.** Implement ADR-013 with frozen, Harness-owned Pydantic models for
+all five named protocol axes: instructions, tools, lifecycle hooks, history
+transforms, and event-stream taps. H3's first feature populates only instructions
+and tools; the other typed tuples remain empty until first use. Keep the memory
+feature and all three handlers free of pydantic-ai imports. Translate that
+definition in the sole `pydantic_ai_adapter.py` module through explicit
+contextual wrappers, and ship
+`MemoryCapability` as a standard capability with stable id `memory` and
+`defer_loading=False`. Pin the direct pydantic-ai dependency to the locally
+verified 2.12.0 API because CI installs from `pyproject.toml`, not `uv.lock`.
+
+**Motivation.** This is the smallest executable form of the two-module law:
+Harness owns the feature contract and pydantic-ai is replaceable adapter
+machinery. Explicit wrappers preserve useful model schemas while invoking the
+handler carried by the owned definition. The exact pin keeps the Capability,
+RunContext, Tool, and Agent APIs from changing underneath an otherwise
+unchanged commit.
+
+**Rejected alternatives.** Importing capability machinery directly into the
+feature or tools would pierce the grep-friendly seam. Dynamic `**kwargs`
+wrappers erase useful tool schemas. Implementing unused lifecycle, history,
+event, deferred-loading, CodeMode, or upstream-battery behavior would be
+speculative milestone work; the owned axes exist without pretending H3 uses
+them. Depending wholesale on pydantic-ai-harness or leaving the direct
+dependency floating would surrender the boundary ADR-013 exists to own.
+
+## 007 — Trusted memory context and conservative mutation semantics [P1.4]
+
+**Decision.** Adopt Garden A-015: expose `force=False` on `save_memory`, forward
+the model's value once, and never infer or retry it. Supply principal, machine,
+agent, thread, project, and path only through frozen run dependencies; agent
+writes use `editor=agent:<agent_id>`. A project-scoped save without a current
+project stops before Spine, while an unscoped save is global. Search carries
+the current project and renders response order as compact deterministic JSON
+lines. Resolve edit targets among all ACTIVE rows for the trusted principal by
+UUID first, then exact case-sensitive label, paging in 200-row C.4 pages with no
+project filter. PATCH only the body and retry exactly once only when Spine
+returns a revision conflict, using that response's current revision.
+
+**Motivation.** Model arguments describe memory content and intent, never
+authority. Principal-wide exact resolution respects active-label uniqueness
+without inventing a GET-by-id route or hiding global/cross-project matches.
+Compact cards preserve the C.4 information needed to choose an edit, and the
+single compare-and-swap retry implements C.6 without turning a conflict into an
+unbounded mutation loop. Similar, duplicate, label, protocol, and transport
+outcomes remain visible instead of masquerading as success.
+
+**Rejected alternatives.** Model-supplied identity or scope is an authority
+leak. Automatic force would bypass the human/model decision C.6 explicitly
+requests. Substring or first-result edit resolution can mutate the wrong unit;
+adding a Spine route would disturb a completed contract packet. Retrying label
+conflicts or a second revision conflict would exceed the one-retry law. A
+guessed secret regex was not added: C.6 supplies a verbatim agent instruction,
+not a deterministic storage policy, and silently inventing one would create
+false security semantics.
+
+## 008 — Bounded chat and tools-free `/remember` service [P1.2, P1.4]
+
+**Decision.** Correct the development/testing default to
+`openrouter:minimax/minimax-m3`; add the C.5 request/token limits, label bound,
+and existing Spine URL to Harness settings. Resolve OpenRouter, Anthropic, and
+OpenAI models with settings-owned secrets passed to explicit providers rather
+than copying secrets into process environment. Reject other direct providers;
+OpenRouter is C.5's deliberate any-model escape hatch. Ordinary chat mounts
+only `MemoryCapability`, preserves opaque pydantic-ai history for the next turn,
+and applies the 40-request/500,000-token walls. `/remember` is a service-level
+dispatch seam for later daemon wiring: a separate tools-free agent uses the
+same selected model under a one-request wall, then the command validates one
+nonblank, single-line label of at most 64 Unicode code points and performs one
+global `kind=fact`, `editor=user`, `force=false` create with trusted provenance.
+Only a 201 creation receives a generated chat confirmation.
+
+**Motivation.** Settings loaded from `.env` must reach provider constructors
+without relying on unrelated global environment state. A separate label agent
+prevents a label completion from invoking memory tools, while the one-request
+wall makes "one short completion" architectural rather than aspirational.
+Returning framework-neutral chat/command results gives H4/H7 a callable seam
+without inventing their still-owned WebSocket payload and loop behavior.
+
+**Rejected alternatives.** The stale Sonnet development default contradicted
+C.5. Reusing the chat agent for labels exposes three unrelated tools; a second
+model call for confirmation spends attention and tokens without adding truth.
+Truncating, regenerating, auto-forcing, or silently retrying a bad label or
+non-created response could save something other than the explicit command.
+Wiring current placeholder daemon routes would pre-empt H7/H4, while adding
+prepare/gate/commit behavior would trespass on H5.
