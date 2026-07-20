@@ -377,6 +377,29 @@ async def test_slow_sink_is_bounded_without_one_task_per_delta() -> None:
 
 
 @pytest.mark.asyncio
+async def test_direct_error_worker_is_owned_until_loop_close() -> None:
+    ids = Ids()
+    loop = RunLoop(ImmediateHistoryRunner(), factory(ids))
+    sink = Sink()
+
+    await loop.cancel(thread_id=None, run_id=ulid(1), sink=sink)
+    await _wait_for_type_count(sink, MessageType.ERROR, 1)
+    workers = [
+        task
+        for task in asyncio.all_tasks()
+        if task.get_name() == "harness-envelope-delivery" and not task.done()
+    ]
+    assert len(workers) == 1
+    assert len(loop._subscriptions) == 1
+    assert loop._subscriptions[0].thread_id is None
+
+    await loop.close()
+
+    assert loop._subscriptions == []
+    assert all(worker.done() for worker in workers)
+
+
+@pytest.mark.asyncio
 async def test_fifo_runs_once_and_survives_error_and_budget_terminals() -> None:
     ids = Ids()
     first = TurnControl(stop_reason=StopReason.ERROR)

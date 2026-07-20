@@ -44,9 +44,9 @@ sh tests/contract/run.sh
 
 Recorded on 2026-07-20:
 
-- 217 non-contract tests passed; 2 live contract tests were deselected.
-- 102 focused H7 cases passed.
-- 40 loop/daemon cases passed with asyncio debug and RuntimeWarnings fatal.
+- 218 non-contract tests passed; 2 live contract tests were deselected.
+- 103 focused H7 cases passed.
+- 41 loop/daemon cases passed with asyncio debug and RuntimeWarnings fatal.
 - Ruff lint/format, lock, M1 scope, web lint/build, and diff checks passed.
 - The disposable migrated Spine contract passed 2 tests and tore down cleanly.
 - The sibling Spine suite passed 158 tests with
@@ -82,5 +82,6 @@ consumers, and the pydantic-ai cancellation seam. Their concrete findings are
 locked into regressions: non-finite JSON rejection; request-first snapshot
 union selection; pre-start and finish/cancel races; no second cancellation
 during tool cleanup; snapshot-before-direct-response ordering; one bounded
-worker rather than one task per delta; `/remember` budget/provider terminal
-classification; and cancellation repair even when tool cleanup raises.
+worker rather than one task per delta; owned cleanup for direct-error workers;
+`/remember` budget/provider terminal classification; and cancellation repair
+even when tool cleanup raises.

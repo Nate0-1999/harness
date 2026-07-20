@@ -633,7 +633,11 @@ class RunLoop:
     async def _send_direct_locked(self, sink: EnvelopeSink, envelope: Envelope) -> None:
         subscription = self._find_sink_locked(sink)
         if subscription is None:
-            subscription = _Subscription(sink=sink, thread_id=envelope.thread_id)
+            # Own even a one-off delivery so detach/close can always stop its
+            # worker. Keep it unbound: a direct error must not silently
+            # resubscribe a sink that was detached after backpressure.
+            subscription = _Subscription(sink=sink, thread_id=None)
+            self._subscriptions.append(subscription)
         self._enqueue_locked(subscription, envelope)
 
     def _enqueue_locked(
