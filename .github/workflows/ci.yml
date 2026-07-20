@@ -25,7 +25,7 @@ jobs:
       - name: Lint
         run: ruff check . && ruff format --check src tests
       - name: Test
-        run: pytest
+        run: pytest -m "not contract"
 
   web:
     name: Web lint and build
@@ -47,27 +47,26 @@ jobs:
       - name: Build
         run: npm run build
 
-  contract-test-skeleton:
-    name: Spine contract tests (H2 skeleton)
-    if: ${{ vars.SPINE_CONTRACT_IMAGE != '' }}
+  contract:
+    name: Live Spine contract tests
     runs-on: ubuntu-latest
-    services:
-      spine:
-        image: ${{ vars.SPINE_CONTRACT_IMAGE }}
-        env:
-          SPINE_TOKEN: contract-test-token
-        ports:
-          - 8000:8000
-    env:
-      SPINE_URL: http://127.0.0.1:8000
-      SPINE_TOKEN: contract-test-token
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+      - name: Checkout pinned Spine
+        uses: actions/checkout@v4
+        with:
+          repository: Nate0-1999/memory-palace
+          ref: 9c51c992b6103ee7492961bcb27fb608c4760446
+          path: _contract/spine
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
       - name: Install harness
         run: python -m pip install --upgrade pip && python -m pip install -e ".[dev]"
-      - name: Run reserved contract marker
-        run: pytest -m contract tests/contract
+      - name: Run live S1-S2 contract
+        env:
+          SPINE_SOURCE_DIR: ${{ github.workspace }}/_contract/spine
+        run: sh tests/contract/run.sh

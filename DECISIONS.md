@@ -95,3 +95,41 @@ handlers across app instances and tests. Passing the raw WebSocket into
 handlers would couple business code to transport, while a one-response return
 value would make the named stream type dishonest. Swallowing handler failures
 into a new error schema would invent behavior the contract does not define.
+
+## 005 — Literal Spine boundary with a hermetic live contract [P1.1]
+
+**Decision.** Adopt the current C.4 surface, including Garden A-014's positive
+prepare-context bound, A-012's search bound, the enacted list bounds, and the
+v1.6 `origin_path` fields. Give each `SpineClient` one owned asynchronous HTTP
+client; ownership includes any caller-supplied test transport and ends through
+`aclose` or the async context manager. Send relative C.4 routes beneath a
+validated, credential-free absolute HTTP(S) base URL with bearer auth, no
+redirects, no retries, and JSON bodies that omit optional nulls. Validate each
+response against its exact status, media type, strict standard-JSON body model,
+and RFC7807 semantics without scalar coercion. Surface RFC7807 responses,
+create conflicts, and PATCH conflicts as distinct typed exceptions that retain
+the raw response without copying its body or credentials into exception text.
+
+Run S1–S2 contract assertions in an unconditional CI job against the production
+Spine Dockerfile at commit `9c51c992b6103ee7492961bcb27fb608c4760446`, a
+disposable pgvector PostgreSQL service, and both Spine migrations. At test
+composition only, mount a Harness-owned app factory that supplies a closed set
+of deterministic 1536-dimensional embeddings through Spine's existing
+provider-injection seam. Tear down the database, network, containers, volume,
+and locally built image after every run.
+
+**Motivation.** Exact status-correlated decoding keeps API drift visible to the
+daemon instead of letting structurally similar success and conflict bodies pass
+under the wrong semantics. Exercising the public client against a migrated,
+real HTTP and pgvector stack proves the cross-repository boundary without cloud
+credentials, external model calls, or changes to Spine production code.
+
+**Rejected alternatives.** Mock-only tests cannot detect routing, migration,
+serialization, or container-startup drift. Following a mutable Spine branch
+would make Harness CI change without a Harness commit. A generated client adds
+another build artifact without reducing this seven-route surface. Retrying
+mutations risks duplicate decisions, while following redirects could send the
+bearer token outside the configured service. Calling OpenAI or the deployed
+cloud service would make routine verification depend on credentials, quota,
+cost, and mutable external state; adding a fake provider to Spine production
+would widen that repository solely for this packet.

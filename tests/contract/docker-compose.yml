@@ -1,0 +1,54 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: spine
+      POSTGRES_PASSWORD: spine
+      POSTGRES_USER: spine
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U spine -d spine"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  spine:
+    build:
+      context: ${SPINE_SOURCE_DIR:?SPINE_SOURCE_DIR must name a Spine checkout}
+    command:
+      - /bin/sh
+      - -c
+      - >-
+        alembic upgrade head &&
+        exec uvicorn contract_app:create_app --factory --host 0.0.0.0 --port 8000
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PYTHONPATH: /contract:/app/src
+      SPINE_DATABASE_URL: postgresql+asyncpg://spine:spine@postgres:5432/spine
+      SPINE_OPENAI_API_KEY: ""
+      SPINE_TOKEN: ${SPINE_TOKEN:?SPINE_TOKEN must be set by the contract runner}
+    volumes:
+      - type: bind
+        source: ./contract_app.py
+        target: /contract/contract_app.py
+        read_only: true
+    ports:
+      - "127.0.0.1:${SPINE_CONTRACT_PORT:?SPINE_CONTRACT_PORT must be set}:8000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          request = urllib.request.Request(
+          'http://127.0.0.1:8000/healthz',
+          headers={'Authorization': 'Bearer ${SPINE_TOKEN}'});
+          response = urllib.request.urlopen(request, timeout=2);
+          assert response.status == 200;
+          response.close()
+      interval: 2s
+      timeout: 3s
+      retries: 60
+      start_period: 2s

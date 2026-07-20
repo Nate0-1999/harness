@@ -1,0 +1,605 @@
+import json
+from collections.abc import Callable
+from typing import Any
+
+import httpx
+import pytest
+
+from harness.spine_client import (
+    CreatedMemoryResponse,
+    CreateMemoryConflictError,
+    CreateMemoryRequest,
+    DuplicateMemoryConflict,
+    FeedbackRequest,
+    InjectCommitRequest,
+    InjectPrepareRequest,
+    LabelConflict,
+    ListMemoriesParams,
+    MemoryKind,
+    MemoryStatus,
+    PatchMemoryConflictError,
+    PatchMemoryRequest,
+    RevisionConflict,
+    SearchRequest,
+    SimilarMemoriesResponse,
+    SpineClient,
+    SpineProblemError,
+    SpineResponseError,
+    SpineTransportError,
+)
+
+JSON = "application/json"
+PROBLEM_JSON = "application/problem+json"
+MEMORY_ID = "12345678-1234-5678-1234-567812345678"
+THREAD_ID = "22345678-1234-5678-1234-567812345678"
+INJECTION_ID = "32345678-1234-5678-1234-567812345678"
+
+
+def memory_unit_payload() -> dict[str, Any]:
+    return {
+        "memory_id": MEMORY_ID,
+        "principal_id": "principal-1",
+        "label": "Editor preference",
+        "body": "The user prefers tabs.",
+        "kind": "preference",
+        "keywords": ["editor", "tabs"],
+        "project_key": None,
+        "thread_origin": None,
+        "origin_path": "src/editor.py",
+        "pin": False,
+        "status": "active",
+        "revision": 1,
+        "stats": {
+            "injections": 0,
+            "removals": 0,
+            "citations": 0,
+            "never_kills": 0,
+            "last_injected_at": None,
+        },
+        "bias": 0.0,
+        "embedding_model": "contract-deterministic-v1",
+        "created_at": "2026-07-20T12:00:00Z",
+        "updated_at": "2026-07-20T12:00:00Z",
+    }
+
+
+def similarity_card_payload() -> dict[str, Any]:
+    return {
+        "memory_id": MEMORY_ID,
+        "label": "Editor preference",
+        "body": "The user prefers tabs.",
+        "kind": "preference",
+        "pin": False,
+        "score": 0.85,
+        "features": None,
+        "rank": None,
+    }
+
+
+def problem_payload(status: int = 503) -> dict[str, Any]:
+    return {
+        "type": "about:blank",
+        "title": "Service Unavailable",
+        "status": status,
+        "detail": "The embedding provider could not complete the request.",
+        "instance": "/v1/search",
+        "endpoint": "POST /v1/search",
+        "trace_id": "trace-1",
+    }
+
+
+def response(status: int, payload: object, media_type: str = JSON) -> httpx.Response:
+    return httpx.Response(
+        status,
+        json=payload,
+        headers={"content-type": f"{media_type}; charset=utf-8"},
+    )
+
+
+def raw_json_response(status: int, payload: object, media_type: str = JSON) -> httpx.Response:
+    return httpx.Response(
+        status,
+        content=json.dumps(payload).encode(),
+        headers={"content-type": f"{media_type}; charset=utf-8"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_all_seven_routes_send_exact_http_contract() -> None:
+    seen: list[httpx.Request] = []
+    responses = {
+        ("POST", "/prefix/v1/inject/prepare"): response(
+            200,
+            {
+                "injection_id": INJECTION_ID,
+                "snapshot_ts": "2026-07-20T12:00:00Z",
+                "scorer_version": "v0",
+                "injected": [],
+                "near_misses": [],
+            },
+        ),
+        ("POST", "/prefix/v1/inject/commit"): response(
+            200, {"final_block": "<memory_system></memory_system>", "wrong_removed": []}
+        ),
+        ("POST", "/prefix/v1/feedback"): response(200, {"ok": True}),
+        ("POST", "/prefix/v1/memories"): response(201, {"created": memory_unit_payload()}),
+        ("PATCH", f"/prefix/v1/memories/{MEMORY_ID}"): response(200, memory_unit_payload()),
+        ("GET", "/prefix/v1/memories"): response(
+            200,
+            {"items": [memory_unit_payload()], "total": 1, "limit": 25, "offset": 5},
+        ),
+        ("POST", "/prefix/v1/search"): response(200, {"results": []}),
+    }
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        assert request.headers["authorization"] == "Bearer contract-token"
+        assert request.headers["accept"] == f"{JSON}, {PROBLEM_JSON}"
+        assert request.extensions["timeout"] == {
+            "connect": 30.0,
+            "read": 30.0,
+            "write": 30.0,
+            "pool": 30.0,
+        }
+        return responses[(request.method, request.url.path)]
+
+    async with SpineClient(
+        "https://spine.invalid/prefix",
+        "contract-token",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        prepared = await client.prepare_injection(
+            InjectPrepareRequest(
+                thread_id=THREAD_ID,
+                agent_id="agent-1",
+                machine_id="machine-1",
+                principal_id="principal-1",
+                prompt="hello",
+                model_context_tokens=200_000,
+            )
+        )
+        committed = await client.commit_injection(
+            InjectCommitRequest(injection_id=INJECTION_ID, removed=[], added_back=[])
+        )
+        feedback = await client.submit_feedback(
+            FeedbackRequest(
+                injection_id=INJECTION_ID,
+                memory_id=MEMORY_ID,
+                signal="cited",
+            )
+        )
+        created = await client.create_memory(
+            CreateMemoryRequest(
+                principal_id="principal-1",
+                label="Editor preference",
+                body="The user prefers tabs.",
+                kind=MemoryKind.PREFERENCE,
+                origin_path="src/editor.py",
+                editor="user",
+                machine_id="machine-1",
+            )
+        )
+        patched = await client.patch_memory(
+            MEMORY_ID,
+            PatchMemoryRequest(
+                expected_revision=1,
+                origin_path="src/editor.py",
+                editor="user",
+                reason="locate source",
+                machine_id="machine-1",
+            ),
+        )
+        listed = await client.list_memories(
+            ListMemoriesParams(status=MemoryStatus.ACTIVE, limit=25, offset=5)
+        )
+        searched = await client.search(SearchRequest(principal_id="principal-1", query="tabs", k=5))
+
+    assert prepared.scorer_version == "v0"
+    assert committed.wrong_removed == []
+    assert feedback.ok is True
+    assert isinstance(created, CreatedMemoryResponse)
+    assert created.created.origin_path == "src/editor.py"
+    assert patched.origin_path == "src/editor.py"
+    assert listed.total == 1
+    assert searched.results == []
+
+    requests = {(item.method, item.url.path): item for item in seen}
+    create_body = json.loads(requests[("POST", "/prefix/v1/memories")].content)
+    assert create_body["origin_path"] == "src/editor.py"
+    assert create_body["force"] is False
+    assert "project_key" not in create_body
+    patch_body = json.loads(requests[("PATCH", f"/prefix/v1/memories/{MEMORY_ID}")].content)
+    assert patch_body["origin_path"] == "src/editor.py"
+    assert "body" not in patch_body
+    list_query = requests[("GET", "/prefix/v1/memories")].url.params
+    assert dict(list_query) == {"status": "active", "limit": "25", "offset": "5"}
+
+
+@pytest.mark.asyncio
+async def test_create_similar_response_is_distinct_from_created_status() -> None:
+    async def handler(_: httpx.Request) -> httpx.Response:
+        return response(200, {"created": None, "similar": [similarity_card_payload()]})
+
+    async with SpineClient(
+        "https://spine.invalid",
+        "token",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        result = await client.create_memory(
+            CreateMemoryRequest(
+                principal_id="principal-1",
+                label="Preference",
+                body="Similar body",
+                kind=MemoryKind.PREFERENCE,
+                editor="user",
+                machine_id="machine-1",
+            )
+        )
+
+    assert isinstance(result, SimilarMemoriesResponse)
+    assert result.similar[0].score == pytest.approx(0.85)
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_type"),
+    [
+        (
+            {"label_conflict": {"memory_id": MEMORY_ID, "label": "Editor preference"}},
+            LabelConflict,
+        ),
+        ({"duplicate_of": similarity_card_payload()}, DuplicateMemoryConflict),
+    ],
+)
+@pytest.mark.asyncio
+async def test_create_409_is_a_typed_domain_conflict(
+    payload: object, expected_type: type[object]
+) -> None:
+    async def handler(_: httpx.Request) -> httpx.Response:
+        return response(409, payload)
+
+    async with SpineClient(
+        "https://spine.invalid",
+        "token",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        with pytest.raises(CreateMemoryConflictError) as caught:
+            await client.create_memory(
+                CreateMemoryRequest(
+                    principal_id="principal-1",
+                    label="Editor preference",
+                    body="Body",
+                    kind=MemoryKind.PREFERENCE,
+                    editor="user",
+                    machine_id="machine-1",
+                )
+            )
+
+    assert isinstance(caught.value.conflict, expected_type)
+    assert caught.value.response.status_code == 409
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_type"),
+    [
+        (
+            {"label_conflict": {"memory_id": MEMORY_ID, "label": "Editor preference"}},
+            LabelConflict,
+        ),
+        ({"conflict": memory_unit_payload()}, RevisionConflict),
+    ],
+)
+@pytest.mark.asyncio
+async def test_patch_409_is_a_typed_domain_conflict(
+    payload: object, expected_type: type[object]
+) -> None:
+    async def handler(_: httpx.Request) -> httpx.Response:
+        return response(409, payload)
+
+    async with SpineClient(
+        "https://spine.invalid",
+        "token",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        with pytest.raises(PatchMemoryConflictError) as caught:
+            await client.patch_memory(
+                MEMORY_ID,
+                PatchMemoryRequest(
+                    expected_revision=1,
+                    label="Editor preference",
+                    editor="user",
+                    reason="rename",
+                    machine_id="machine-1",
+                ),
+            )
+
+    assert isinstance(caught.value.conflict, expected_type)
+    assert caught.value.response.status_code == 409
+
+
+@pytest.mark.parametrize(
+    ("route", "status"),
+    [("search", 503), ("create", 409), ("patch", 409)],
+)
+@pytest.mark.asyncio
+async def test_rfc7807_errors_remain_typed_problems(route: str, status: int) -> None:
+    async def handler(_: httpx.Request) -> httpx.Response:
+        return response(status, problem_payload(status), PROBLEM_JSON)
+
+    async with SpineClient(
+        "https://spine.invalid",
+        "token",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        with pytest.raises(SpineProblemError) as caught:
+            if route == "search":
+                await client.search(SearchRequest(principal_id="principal-1", query="tabs"))
+            elif route == "create":
+                await client.create_memory(
+                    CreateMemoryRequest(
+                        principal_id="principal-1",
+                        label="Preference",
+                        body="Body",
+                        kind=MemoryKind.PREFERENCE,
+                        editor="user",
+                        machine_id="machine-1",
+                    )
+                )
+            else:
+                await client.patch_memory(
+                    MEMORY_ID,
+                    PatchMemoryRequest(
+                        expected_revision=1,
+                        label="Preference",
+                        editor="user",
+                        reason="rename",
+                        machine_id="machine-1",
+                    ),
+                )
+
+    assert caught.value.problem.status == status
+    assert caught.value.problem.endpoint == "POST /v1/search"
+    assert caught.value.problem.model_extra == {"trace_id": "trace-1"}
+    assert "trace-1" not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "make_response",
+    [
+        pytest.param(
+            lambda: httpx.Response(200, text="not json", headers={"content-type": JSON}),
+            id="invalid-json",
+        ),
+        pytest.param(
+            lambda: response(200, {"results": []}, "text/plain"),
+            id="wrong-media-type",
+        ),
+        pytest.param(
+            lambda: response(200, {"unexpected": []}),
+            id="wrong-shape",
+        ),
+        pytest.param(
+            lambda: response(201, {"results": []}),
+            id="wrong-success-status",
+        ),
+        pytest.param(
+            lambda: response(503, {**problem_payload(), "status": 500}, PROBLEM_JSON),
+            id="problem-status-mismatch",
+        ),
+        pytest.param(
+            lambda: response(503, problem_payload(), JSON),
+            id="wrong-problem-media-type",
+        ),
+        pytest.param(
+            lambda: response(
+                200,
+                {"results": [{**similarity_card_payload(), "score": "0.85"}]},
+            ),
+            id="coerced-success-scalar",
+        ),
+        pytest.param(
+            lambda: response(503, {**problem_payload(), "status": "503"}, PROBLEM_JSON),
+            id="coerced-problem-scalar",
+        ),
+        pytest.param(
+            lambda: raw_json_response(
+                200,
+                {"results": [{**similarity_card_payload(), "score": float("nan")}]},
+            ),
+            id="non-standard-json-constant",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_response_contract_violations_are_not_silently_accepted(
+    make_response: Callable[[], httpx.Response],
+) -> None:
+    async def handler(_: httpx.Request) -> httpx.Response:
+        return make_response()
+
+    async with SpineClient(
+        "https://spine.invalid",
+        "token",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        with pytest.raises(SpineResponseError):
+            await client.search(SearchRequest(principal_id="principal-1", query="tabs"))
+
+
+@pytest.mark.asyncio
+async def test_rfc7807_standard_members_are_optional_but_not_nullable() -> None:
+    payloads = [{}, {"title": None}]
+
+    async def handler(_: httpx.Request) -> httpx.Response:
+        return response(503, payloads.pop(0), PROBLEM_JSON)
+
+    async with SpineClient(
+        "https://spine.invalid",
+        "token",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        with pytest.raises(SpineProblemError) as minimal:
+            await client.search(SearchRequest(principal_id="principal-1", query="tabs"))
+        with pytest.raises(SpineResponseError) as explicit_null:
+            await client.search(SearchRequest(principal_id="principal-1", query="tabs"))
+
+    assert minimal.value.problem.type == "about:blank"
+    assert minimal.value.problem.status is None
+    assert type(explicit_null.value) is SpineResponseError
+
+
+@pytest.mark.asyncio
+async def test_create_status_and_body_cannot_be_swapped() -> None:
+    async def handler(_: httpx.Request) -> httpx.Response:
+        return response(200, {"created": memory_unit_payload()})
+
+    async with SpineClient(
+        "https://spine.invalid",
+        "token",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        with pytest.raises(SpineResponseError):
+            await client.create_memory(
+                CreateMemoryRequest(
+                    principal_id="principal-1",
+                    label="Preference",
+                    body="Body",
+                    kind=MemoryKind.PREFERENCE,
+                    editor="user",
+                    machine_id="machine-1",
+                )
+            )
+
+
+@pytest.mark.asyncio
+async def test_transport_failure_is_wrapped_without_request_secrets() -> None:
+    calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        raise httpx.ConnectError("dial failed", request=request)
+
+    async with SpineClient(
+        "https://spine.invalid",
+        "secret-token",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        with pytest.raises(SpineTransportError) as caught:
+            await client.search(SearchRequest(principal_id="principal-1", query="tabs"))
+
+    assert isinstance(caught.value.__cause__, httpx.ConnectError)
+    assert "secret-token" not in str(caught.value)
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_response_decoding_failure_is_wrapped_as_transport_failure() -> None:
+    async def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=b"not a gzip stream",
+            headers={"content-encoding": "gzip", "content-type": JSON},
+        )
+
+    async with SpineClient(
+        "https://spine.invalid",
+        "token",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        with pytest.raises(SpineTransportError) as caught:
+            await client.search(SearchRequest(principal_id="principal-1", query="tabs"))
+
+    assert isinstance(caught.value.__cause__, httpx.DecodingError)
+
+
+@pytest.mark.asyncio
+async def test_redirects_are_not_followed() -> None:
+    calls = 0
+
+    async def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(307, headers={"location": "https://other.invalid/v1/search"})
+
+    async with SpineClient(
+        "https://spine.invalid",
+        "token",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        with pytest.raises(SpineResponseError):
+            await client.search(SearchRequest(principal_id="principal-1", query="tabs"))
+
+    assert calls == 1
+
+
+class CloseAwareTransport(httpx.AsyncBaseTransport):
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def handle_async_request(self, _: httpx.Request) -> httpx.Response:
+        return response(200, {"results": []})
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+@pytest.mark.asyncio
+async def test_context_manager_closes_caller_supplied_transport() -> None:
+    transport = CloseAwareTransport()
+
+    async with SpineClient(
+        "https://spine.invalid",
+        "token",
+        transport=transport,
+    ) as client:
+        await client.search(SearchRequest(principal_id="principal-1", query="tabs"))
+
+    assert transport.closed is True
+
+
+def test_constructor_rejects_missing_connection_values() -> None:
+    for base_url in ("", "   "):
+        with pytest.raises(ValueError, match="base_url"):
+            SpineClient(base_url, "token")
+    for token in ("", "   "):
+        with pytest.raises(ValueError, match="token"):
+            SpineClient("https://spine.invalid", token)
+    with pytest.raises(ValueError, match="token"):
+        SpineClient("https://spine.invalid", " token ")
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "spine.invalid/prefix",
+        "/prefix",
+        "://bad",
+        "ftp://spine.invalid/prefix",
+        "http://",
+        "http://spine.invalid:bad",
+        "https://user:pass@spine.invalid/prefix",
+        "https://spine.invalid/prefix?mode=test",
+        "https://spine.invalid/prefix?",
+        "https://spine.invalid/prefix#fragment",
+        "https://spine.invalid/prefix#",
+    ],
+)
+def test_constructor_rejects_unsafe_base_urls(base_url: str) -> None:
+    with pytest.raises(ValueError, match="base_url"):
+        SpineClient(base_url, "token")
+
+
+@pytest.mark.asyncio
+async def test_base_url_normalization_preserves_encoded_path_segments() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.raw_path == b"/tenant%2Fone/v1/search"
+        return response(200, {"results": []})
+
+    async with SpineClient(
+        "  https://spine.invalid/tenant%2Fone//  ",
+        "token",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        result = await client.search(SearchRequest(principal_id="principal-1", query="tabs"))
+
+    assert result.results == []

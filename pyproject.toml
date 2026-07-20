@@ -34,7 +34,7 @@ packages = ["src/harness"]
 addopts = "-ra"
 testpaths = ["tests"]
 markers = [
-  "contract: requires a live spine service (implemented in H2)",
+  "contract: requires the live Spine and pgvector stack started by tests/contract/run.sh",
 ]
 
 [tool.ruff]

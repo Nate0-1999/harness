@@ -39,6 +39,7 @@ def memory_unit_payload() -> dict[str, object]:
         "keywords": ["editor", "tabs"],
         "project_key": None,
         "thread_origin": None,
+        "origin_path": None,
         "pin": False,
         "status": "active",
         "revision": 1,
@@ -91,6 +92,7 @@ def test_client_exposes_all_seven_c4_routes() -> None:
     }
 
     assert methods == {
+        "aclose",
         "prepare_injection",
         "commit_injection",
         "submit_feedback",
@@ -133,6 +135,7 @@ def test_memory_unit_is_the_shared_c4_shape() -> None:
         "keywords",
         "project_key",
         "thread_origin",
+        "origin_path",
         "pin",
         "status",
         "revision",
@@ -200,6 +203,7 @@ def test_create_request_has_machine_id_and_similar_band_force() -> None:
     )
 
     assert request.machine_id == "machine-1"
+    assert request.origin_path is None
     assert request.force is False
     assert CreateMemoryRequest(**{**request.model_dump(), "force": True}).force is True
 
@@ -248,6 +252,7 @@ def test_patch_request_and_exact_success_conflict_bodies() -> None:
     conflicts = TypeAdapter(PatchMemoryConflict)
 
     assert request.machine_id == "machine-1"
+    assert request.origin_path is None
     assert current.revision == conflict.conflict.revision == 1
     assert conflicts.validate_python(conflict).conflict.revision == 1
     assert conflicts.validate_python(label_conflict).label_conflict.label == request.label
@@ -270,6 +275,10 @@ def test_list_params_and_response_mirror_stable_paging_contract() -> None:
     assert response.items[0].label == "Editor preference"
     with pytest.raises(ValidationError):
         ListMemoriesParams(limit=201)
+    with pytest.raises(ValidationError):
+        ListMemoriesParams(limit=0)
+    with pytest.raises(ValidationError):
+        ListMemoriesParams(offset=-1)
 
 
 def test_contract_models_reject_unspecified_fields() -> None:
@@ -284,12 +293,21 @@ def test_search_default_is_literal_c4_value() -> None:
     request = SearchRequest(principal_id="principal-1", query="tabs")
 
     assert request.k == 10
+    assert SearchRequest(principal_id="principal-1", query="tabs", k=1).k == 1
+    assert SearchRequest(principal_id="principal-1", query="tabs", k=50).k == 50
+    for invalid in (0, 51, True):
+        with pytest.raises(ValidationError):
+            SearchRequest(principal_id="principal-1", query="tabs", k=invalid)
 
 
-@pytest.mark.asyncio
-async def test_stub_has_no_transport_behavior() -> None:
-    client = SpineClient("https://spine.invalid", "token")
-    request = SearchRequest(principal_id="principal-1", query="tabs")
-
-    with pytest.raises(NotImplementedError, match="belongs to H2"):
-        await client.search(request)
+def test_prepare_requires_positive_model_context() -> None:
+    for invalid in (0, -1):
+        with pytest.raises(ValidationError):
+            InjectPrepareRequest(
+                thread_id="12345678-1234-5678-1234-567812345678",
+                agent_id="agent-1",
+                machine_id="machine-1",
+                principal_id="principal-1",
+                prompt="hello",
+                model_context_tokens=invalid,
+            )
