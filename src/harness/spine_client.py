@@ -4,7 +4,7 @@ import json
 import math
 from datetime import datetime
 from enum import StrEnum
-from typing import Any, Literal, Never
+from typing import Annotated, Any, Literal, Never
 from uuid import UUID
 
 import httpx
@@ -45,13 +45,18 @@ class FeedbackSignal(StrEnum):
     CITED = "cited"
 
 
+type FiniteScore = Annotated[float, Field(strict=True)]
+type RawFeatureScore = Annotated[float, Field(strict=True, ge=0, le=1)]
+type PositiveRank = Annotated[int, Field(strict=True, ge=1)]
+
+
 class MemoryFeatures(ContractModel):
-    sem: float
-    kw: float
-    time: float
-    proj: float
-    freq: float
-    hist: float
+    sem: RawFeatureScore
+    kw: RawFeatureScore
+    time: RawFeatureScore
+    proj: RawFeatureScore
+    freq: RawFeatureScore
+    hist: RawFeatureScore
 
 
 class MemoryCard(ContractModel):
@@ -60,7 +65,7 @@ class MemoryCard(ContractModel):
     body: str
     kind: MemoryKind
     pin: bool
-    score: float
+    score: FiniteScore
     features: MemoryFeatures | None
     rank: int | None
 
@@ -69,7 +74,7 @@ class ScoredMemoryCard(MemoryCard):
     """Inject/prepare card, where C.4 requires scoring details."""
 
     features: MemoryFeatures
-    rank: int
+    rank: PositiveRank
 
 
 class SimilarityMemoryCard(MemoryCard):

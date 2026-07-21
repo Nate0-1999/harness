@@ -25,7 +25,8 @@ from pydantic_ai.messages import (
 from pydantic_ai.usage import RunUsage
 from pydantic_core import to_jsonable_python
 
-from harness.agent import HarnessAgent, RememberResult, remember_command_text
+from harness.agent import HarnessAgent, RememberResult
+from harness.commands import remember_command_text
 from harness.envelope import StopReason
 from harness.run_protocol import RunEmitter, TurnOutcome, UsageSnapshot
 from harness.tools_memory import MemoryToolContext
@@ -49,6 +50,7 @@ class PydanticAITurnRunner:
         prompt: str,
         message_history: Sequence[object],
         emit: RunEmitter,
+        system_instructions: str | None = None,
     ) -> TurnOutcome:
         """Execute a turn and convert every terminal path to a stable outcome."""
 
@@ -79,6 +81,7 @@ class PydanticAITurnRunner:
                 result = await self._agent.chat_agent.run(
                     prompt,
                     deps=context,
+                    instructions=system_instructions,
                     message_history=cast(Sequence[ModelMessage], message_history),
                     usage_limits=self._agent.usage_limits,
                     usage=run_usage,

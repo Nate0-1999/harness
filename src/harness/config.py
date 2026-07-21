@@ -1,6 +1,6 @@
 """Harness configuration for the C.4 client and C.5 agent limits."""
 
-from pydantic import Field, SecretStr
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -22,6 +22,14 @@ class HarnessSettings(BaseSettings):
     openai_api_key: SecretStr | None = None
     openrouter_api_key: SecretStr | None = None
     chat_model: str = "openrouter:minimax/minimax-m3"
+    model_context_tokens: int = Field(default=1_000_000, ge=1)
     run_request_limit: int = Field(default=40, ge=1)
     run_total_tokens_limit: int = Field(default=500_000, ge=1)
     label_max: int = Field(default=64, ge=1)
+
+    @field_validator("model_context_tokens", mode="before")
+    @classmethod
+    def reject_boolean_context_window(cls, value: object) -> object:
+        if isinstance(value, bool):
+            raise ValueError("model_context_tokens must be an integer")
+        return value

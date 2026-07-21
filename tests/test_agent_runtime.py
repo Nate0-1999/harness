@@ -8,14 +8,19 @@ from uuid import UUID
 
 import pytest
 from pydantic_ai import models
-from pydantic_ai.messages import ModelRequest, ModelResponse, ToolCallPart, ToolReturnPart
+from pydantic_ai.messages import (
+    ModelRequest,
+    ModelResponse,
+    ToolCallPart,
+    ToolReturnPart,
+)
 from pydantic_ai.models.function import DeltaThinkingPart, DeltaToolCall, FunctionModel
 from pydantic_ai.models.test import TestModel
 
 from harness.agent import HarnessAgent
 from harness.agent_runtime import PydanticAITurnRunner
 from harness.config import HarnessSettings
-from harness.envelope import StopReason
+from harness.envelope import GateCommitPayload, StopReason
 from harness.run_protocol import UsageSnapshot
 from harness.tools_memory import MemoryToolContext
 
@@ -67,6 +72,8 @@ class RecordingEmitter:
     events: list[Mapping[str, object]] = field(default_factory=list)
     usages: list[UsageSnapshot] = field(default_factory=list)
     gates: list[Mapping[str, object]] = field(default_factory=list)
+    errors: list[Mapping[str, object]] = field(default_factory=list)
+    gate_dismissals: int = 0
 
     async def text(self, value: str) -> None:
         self.texts.append(value)
@@ -80,8 +87,15 @@ class RecordingEmitter:
     async def usage(self, value: UsageSnapshot) -> None:
         self.usages.append(value)
 
-    async def open_gate(self, value: Mapping[str, object]) -> None:
+    async def open_gate(self, value: Mapping[str, object]) -> GateCommitPayload:
         self.gates.append(value)
+        raise AssertionError("runtime adapter must not orchestrate gates")
+
+    async def dismiss_gate(self) -> None:
+        self.gate_dismissals += 1
+
+    async def error(self, value: Mapping[str, object]) -> None:
+        self.errors.append(value)
 
 
 @pytest.mark.asyncio
@@ -138,6 +152,34 @@ async def test_streams_typed_deltas_events_cumulative_usage_and_reusable_history
     assert second.stop_reason is StopReason.END_TURN
     assert second.message_history[: len(first.message_history)] == first.message_history
     assert requested_threads == ["thread-1", "thread-1"]
+
+
+@pytest.mark.asyncio
+async def test_final_memory_block_is_system_adjacent_not_user_prompt_text() -> None:
+    observed_messages = []
+
+    async def respond(messages, _info):
+        observed_messages.extend(messages)
+        yield "answer"
+
+    runner = PydanticAITurnRunner(
+        HarnessAgent(settings(), model=FunctionModel(stream_function=respond)),
+        lambda _: context(),
+    )
+    outcome = await runner.run(
+        thread_id="thread-1",
+        prompt="actual user prompt",
+        message_history=(),
+        emit=RecordingEmitter(),
+        system_instructions="trusted final memory block",
+    )
+
+    assert outcome.stop_reason is StopReason.END_TURN
+    requests = [message for message in observed_messages if isinstance(message, ModelRequest)]
+    assert len(requests) == 1
+    assert requests[0].instructions is not None
+    assert requests[0].instructions.endswith("\ntrusted final memory block")
+    assert all("trusted final memory block" not in str(part.content) for part in requests[0].parts)
 
 
 @pytest.mark.asyncio

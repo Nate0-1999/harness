@@ -122,11 +122,13 @@ function errorFromPayload(payload: JsonValue): HarnessError {
   } else if (
     typeof payload === 'object' &&
     payload !== null &&
-    !Array.isArray(payload) &&
-    typeof payload.code === 'string' &&
-    payload.code.trim()
+    !Array.isArray(payload)
   ) {
-    message = payload.code.replaceAll('_', ' ')
+    if (typeof payload.message === 'string' && payload.message.trim()) {
+      message = payload.message
+    } else if (typeof payload.code === 'string' && payload.code.trim()) {
+      message = payload.code.replaceAll('_', ' ')
+    }
   }
   return { message, detail: payload }
 }
@@ -363,19 +365,25 @@ function applyEvent(thread: ThreadState, event: DecodedServerEvent): ThreadState
       return {
         ...thread,
         openGate: event.payload,
+        lastError: null,
         activeRun:
           thread.activeRun?.run_id === event.payload.run_id
             ? { ...thread.activeRun, state: 'waiting_gate' }
             : thread.activeRun,
       }
-    case 'gate.dismiss':
+    case 'gate.dismiss': {
+      const matchesGate = thread.openGate?.run_id === event.payload.run_id
       return {
         ...thread,
-        openGate:
-          thread.openGate?.run_id === event.payload.run_id
-            ? null
-            : thread.openGate,
+        openGate: matchesGate ? null : thread.openGate,
+        activeRun:
+          matchesGate &&
+          thread.activeRun?.run_id === event.payload.run_id &&
+          thread.activeRun.state === 'waiting_gate'
+            ? { ...thread.activeRun, state: 'running' }
+            : thread.activeRun,
       }
+    }
     case 'error':
       return { ...thread, lastError: errorFromPayload(event.payload) }
     default:

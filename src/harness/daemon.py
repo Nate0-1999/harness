@@ -20,12 +20,14 @@ from harness.config import HarnessSettings
 from harness.envelope import (
     Envelope,
     EnvelopeFactory,
+    GateCommitPayload,
     MessageType,
     PromptSubmitPayload,
     RunCancelPayload,
     StopReason,
     ThreadSnapshotRequestPayload,
 )
+from harness.memory_gate import MemoryGateTurnRunner
 from harness.run_loop import RunLoop
 from harness.run_protocol import RunEmitter, TurnOutcome, UsageSnapshot
 from harness.spine_client import SpineClient
@@ -146,7 +148,7 @@ def create_app(
         async def send(message: Envelope) -> None:
             if not connected or resync_required.is_set():
                 return
-            validated = Envelope.model_validate(message.model_dump(mode="python"))
+            validated = Envelope.model_validate(message.model_dump(mode="json"))
             try:
                 outbox.put_nowait(validated)
             except asyncio.QueueFull:
@@ -217,6 +219,14 @@ def create_app(
                             else None
                         ),
                         run_id=message.payload.run_id,
+                        sink=send,
+                    )
+                elif message.type is MessageType.GATE_COMMIT:
+                    assert isinstance(message.payload, GateCommitPayload)
+                    assert message.thread_id is not None
+                    await loop.commit_gate(
+                        thread_id=message.thread_id,
+                        decision=message.payload,
                         sink=send,
                     )
                 elif message.type is MessageType.THREAD_SNAPSHOT and isinstance(
@@ -298,7 +308,13 @@ def create_dev_app(
             origin_path=None,
         )
 
-    loop = RunLoop(PydanticAITurnRunner(owned_agent, context_factory), factory)
+    runner = MemoryGateTurnRunner(
+        PydanticAITurnRunner(owned_agent, context_factory),
+        owned_spine,
+        context_factory,
+        model_context_tokens=configured.model_context_tokens,
+    )
+    loop = RunLoop(runner, factory)
     app = create_app(
         web_dist,
         run_loop=loop,

@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Annotated, Any, Literal
+from uuid import UUID
 
 from pydantic import (
     AfterValidator,
@@ -21,6 +22,8 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+
+from harness.spine_client import RemovedMemory, ScoredMemoryCard
 
 # A ULID is 128 bits encoded as 26 Crockford Base32 characters. The leading
 # character is limited to 0–7 so the 130-bit textual space cannot overflow.
@@ -161,10 +164,25 @@ class RunDonePayload(_ExtensiblePayload):
 class GateOpenPayload(_ExtensiblePayload):
     run_id: ULID
     kind: Literal["memory_gate"]
+    injection_id: UUID
+    snapshot_ts: datetime
+    scorer_version: NonBlankString
+    injected: list[ScoredMemoryCard]
+    near_misses: list[ScoredMemoryCard]
+
+    @model_validator(mode="after")
+    def require_unique_card_membership(self) -> "GateOpenPayload":
+        memory_ids = [card.memory_id for card in (*self.injected, *self.near_misses)]
+        if len(set(memory_ids)) != len(memory_ids):
+            raise ValueError("gate cards must have unique memory_id values")
+        return self
 
 
 class GateCommitPayload(_ExtensiblePayload):
     run_id: ULID
+    injection_id: UUID
+    removed: list[RemovedMemory]
+    added_back: list[UUID]
 
 
 class GateDismissPayload(_ExtensiblePayload):
@@ -270,15 +288,18 @@ class Envelope(BaseModel):
 
     @model_validator(mode="after")
     def validate_type_payload_contract(self) -> "Envelope":
+        raw_payload = _JSON_ADAPTER.validate_python(self.payload)
         adapter = _PAYLOAD_ADAPTERS.get(self.type) if isinstance(self.type, MessageType) else None
         if adapter is not None:
-            payload = adapter.validate_python(self.payload)
-            _JSON_ADAPTER.validate_python(payload.model_dump(mode="python"))
+            payload = adapter.validate_python(raw_payload)
         else:
-            payload = _JSON_ADAPTER.validate_python(self.payload)
+            payload = raw_payload
         object.__setattr__(self, "payload", payload)
 
-        requires_thread = self.type is MessageType.PROMPT_SUBMIT or (
+        requires_thread = self.type in {
+            MessageType.PROMPT_SUBMIT,
+            MessageType.GATE_COMMIT,
+        } or (
             self.type is MessageType.THREAD_SNAPSHOT
             and isinstance(payload, ThreadSnapshotRequestPayload)
         )
@@ -331,7 +352,7 @@ class EnvelopeFactory:
         """Create one validated envelope, allocating a new outer ID and timestamp."""
 
         raw_payload: JsonValue = (
-            payload.model_dump(mode="python") if isinstance(payload, BaseModel) else payload
+            payload.model_dump(mode="json") if isinstance(payload, BaseModel) else payload
         )
         return Envelope.model_validate(
             {

@@ -31,6 +31,50 @@ ENVELOPE_ID = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 RUN_ID = "01ARZ3NDEKTSV4RRFFQ69G5FAW"
 PROMPT_ID = "01ARZ3NDEKTSV4RRFFQ69G5FAX"
 SECOND_ID = "01ARZ3NDEKTSV4RRFFQ69G5FAY"
+INJECTION_ID = "32345678-1234-5678-1234-567812345678"
+MEMORY_ID = "42345678-1234-5678-1234-567812345678"
+
+
+def scored_card() -> dict[str, object]:
+    return {
+        "memory_id": MEMORY_ID,
+        "label": "Preferred editor",
+        "body": "Use the configured editor for text changes.",
+        "kind": "preference",
+        "pin": False,
+        "score": 0.85,
+        "features": {
+            "sem": 0.9,
+            "kw": 0.8,
+            "time": 0.7,
+            "proj": 0.6,
+            "freq": 0.5,
+            "hist": 0.4,
+        },
+        "rank": 1,
+    }
+
+
+def gate_open_payload(**extensions: object) -> dict[str, object]:
+    return {
+        "run_id": RUN_ID,
+        "kind": "memory_gate",
+        "injection_id": INJECTION_ID,
+        "snapshot_ts": "2026-07-21T12:00:00Z",
+        "scorer_version": "m1-v1",
+        "injected": [scored_card()],
+        "near_misses": [],
+        **extensions,
+    }
+
+
+def gate_commit_payload() -> dict[str, object]:
+    return {
+        "run_id": RUN_ID,
+        "injection_id": INJECTION_ID,
+        "removed": [{"memory_id": MEMORY_ID, "reason": "not_relevant"}],
+        "added_back": [],
+    }
 
 
 def valid_envelope() -> dict[str, object]:
@@ -157,8 +201,8 @@ def test_optional_agent_and_thread_ids_may_be_absent_for_untyped_extension() -> 
             },
             RunUsagePayload,
         ),
-        ("gate.open", {"run_id": RUN_ID, "kind": "memory_gate"}, GateOpenPayload),
-        ("gate.commit", {"run_id": RUN_ID}, GateCommitPayload),
+        ("gate.open", gate_open_payload(), GateOpenPayload),
+        ("gate.commit", gate_commit_payload(), GateCommitPayload),
         ("gate.dismiss", {"run_id": RUN_ID}, GateDismissPayload),
     ],
 )
@@ -262,6 +306,61 @@ def test_prompt_submit_requires_nonblank_prompt_and_outer_thread() -> None:
             Envelope.model_validate(raw)
 
 
+def test_gate_commit_requires_outer_thread() -> None:
+    raw = {
+        **valid_envelope(),
+        "thread_id": None,
+        "type": "gate.commit",
+        "payload": gate_commit_payload(),
+    }
+
+    with pytest.raises(ValidationError):
+        Envelope.model_validate(raw)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {**gate_open_payload(), "scorer_version": "  "},
+        {**gate_open_payload(), "injected": [{**scored_card(), "features": None}]},
+        {**gate_open_payload(), "near_misses": [{**scored_card(), "rank": None}]},
+        {**gate_commit_payload(), "removed": [{"memory_id": MEMORY_ID, "reason": "later"}]},
+    ],
+)
+def test_memory_gate_payloads_enforce_exact_c4_member_types(
+    payload: dict[str, object],
+) -> None:
+    message_type = "gate.commit" if "removed" in payload else "gate.open"
+    with pytest.raises(ValidationError):
+        envelope_for(message_type, payload)
+
+
+@pytest.mark.parametrize(
+    "card_update",
+    [
+        {"rank": 0},
+        {"rank": True},
+        {"score": True},
+        {"features": {**scored_card()["features"], "sem": -0.01}},
+        {"features": {**scored_card()["features"], "hist": 1.01}},
+    ],
+)
+def test_gate_open_rejects_cards_the_browser_cannot_render_truthfully(
+    card_update: dict[str, object],
+) -> None:
+    payload = gate_open_payload(injected=[{**scored_card(), **card_update}])
+
+    with pytest.raises(ValidationError):
+        envelope_for("gate.open", payload)
+
+
+def test_gate_open_rejects_duplicate_membership_across_card_arrays() -> None:
+    payload = gate_open_payload(near_misses=[scored_card()])
+
+    with pytest.raises(ValidationError):
+        envelope_for("gate.open", payload)
+
+
 def test_thread_snapshot_request_requires_outer_thread() -> None:
     request = envelope_for("thread.snapshot", {"request": True})
     assert isinstance(request.payload, ThreadSnapshotRequestPayload)
@@ -296,11 +395,7 @@ def test_thread_snapshot_response_types_nested_authoritative_state() -> None:
             {"role": "user", "content": "hello"},
             {"role": "assistant", "content": "par", "partial": True},
         ],
-        "open_gate": {
-            "run_id": RUN_ID,
-            "kind": "memory_gate",
-            "injection_id": "injection-1",
-        },
+        "open_gate": gate_open_payload(),
         "active_run": {
             "run_id": RUN_ID,
             "prompt_id": PROMPT_ID,
@@ -356,17 +451,15 @@ def test_unknown_and_extensible_known_payloads_reject_nonfinite_numbers(
     with pytest.raises(ValidationError):
         envelope_for(
             "gate.open",
-            {"run_id": RUN_ID, "kind": "memory_gate", "weight": value},
+            gate_open_payload(weight=value),
         )
 
 
 def test_minimum_payload_extensions_are_json_typed_and_preserved() -> None:
-    payload = {
-        "run_id": RUN_ID,
-        "kind": "memory_gate",
-        "candidate_ids": ["a", "b"],
-        "details": {"count": 2},
-    }
+    payload = gate_open_payload(
+        candidate_ids=["a", "b"],
+        details={"count": 2},
+    )
     envelope = envelope_for("gate.open", payload)
 
     assert envelope.model_dump(mode="json")["payload"] == payload
@@ -374,7 +467,7 @@ def test_minimum_payload_extensions_are_json_typed_and_preserved() -> None:
     with pytest.raises(ValidationError):
         envelope_for(
             "gate.open",
-            {"run_id": RUN_ID, "kind": "memory_gate", "at": datetime.now(UTC)},
+            gate_open_payload(at=datetime.now(UTC)),
         )
 
 

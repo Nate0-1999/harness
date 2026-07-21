@@ -1,6 +1,8 @@
 const ULID_ALPHABET = '0123456789ABCDEFGHJKMNPQRSTVWXYZ'
 const ULID_PATTERN = /^[0-7][0-9A-HJKMNP-TV-Z]{25}$/i
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+const ISO_8601_PATTERN =
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/
 const MAX_ULID_TIME = 281_474_976_710_655
 const MAX_ULID_RANDOM = (1n << 80n) - 1n
 
@@ -93,9 +95,56 @@ export interface ActiveRunSnapshot {
   queued: QueuedPrompt[]
 }
 
+export type MemoryKind =
+  | 'fact'
+  | 'preference'
+  | 'procedure'
+  | 'project_note'
+  | 'persona'
+  | 'pinned'
+
+export type MemoryFeatures = JsonObject & {
+  sem: number
+  kw: number
+  time: number
+  proj: number
+  freq: number
+  hist: number
+}
+
+export type ScoredMemoryCard = JsonObject & {
+  memory_id: string
+  label: string
+  body: string
+  kind: MemoryKind
+  pin: boolean
+  score: number
+  features: MemoryFeatures
+  rank: number
+}
+
 export type GateOpenPayload = JsonObject & {
   run_id: Ulid
   kind: 'memory_gate'
+  injection_id: string
+  snapshot_ts: string
+  scorer_version: string
+  injected: ScoredMemoryCard[]
+  near_misses: ScoredMemoryCard[]
+}
+
+export type RemovalReason = 'not_relevant' | 'wrong' | 'never'
+
+export type RemovedMemoryDecision = JsonObject & {
+  memory_id: string
+  reason: RemovalReason
+}
+
+export type GateCommitPayload = JsonObject & {
+  run_id: Ulid
+  injection_id: string
+  removed: RemovedMemoryDecision[]
+  added_back: string[]
 }
 
 export interface ThreadSnapshotPayload {
@@ -146,6 +195,7 @@ export interface BrowserPayloadMap {
   'thread.snapshot': { request: true }
   'prompt.submit': { prompt: string }
   'run.cancel': { run_id: Ulid }
+  'gate.commit': GateCommitPayload
 }
 
 export type BrowserMessageType = keyof BrowserPayloadMap
@@ -255,6 +305,14 @@ function isIsoTimestamp(value: unknown): value is string {
   return typeof value === 'string' && !Number.isNaN(Date.parse(value))
 }
 
+function isIso8601Timestamp(value: unknown): value is string {
+  return (
+    typeof value === 'string' &&
+    ISO_8601_PATTERN.test(value) &&
+    !Number.isNaN(Date.parse(value))
+  )
+}
+
 export function parseEnvelope(raw: string): Envelope | null {
   let value: unknown
   try {
@@ -339,15 +397,131 @@ function parseActiveRun(value: unknown): ActiveRunSnapshot | null {
   }
 }
 
+const MEMORY_KINDS: readonly MemoryKind[] = [
+  'fact',
+  'preference',
+  'procedure',
+  'project_note',
+  'persona',
+  'pinned',
+]
+
+const FEATURE_KEYS = ['sem', 'kw', 'time', 'proj', 'freq', 'hist'] as const
+const CARD_KEYS = [
+  'memory_id',
+  'label',
+  'body',
+  'kind',
+  'pin',
+  'score',
+  'features',
+  'rank',
+] as const
+
+function hasExactKeys(
+  value: Record<string, unknown>,
+  expected: readonly string[],
+): boolean {
+  const actual = Object.keys(value)
+  return actual.length === expected.length && expected.every((key) => key in value)
+}
+
+function parseMemoryFeatures(value: unknown): MemoryFeatures | null {
+  if (!isRecord(value) || !hasExactKeys(value, FEATURE_KEYS)) {
+    return null
+  }
+  for (const key of FEATURE_KEYS) {
+    const feature = value[key]
+    if (
+      typeof feature !== 'number' ||
+      !Number.isFinite(feature) ||
+      feature < 0 ||
+      feature > 1
+    ) {
+      return null
+    }
+  }
+  return {
+    sem: value.sem as number,
+    kw: value.kw as number,
+    time: value.time as number,
+    proj: value.proj as number,
+    freq: value.freq as number,
+    hist: value.hist as number,
+  }
+}
+
+function parseScoredMemoryCard(value: unknown): ScoredMemoryCard | null {
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, CARD_KEYS) ||
+    !isUuid(value.memory_id) ||
+    typeof value.label !== 'string' ||
+    typeof value.body !== 'string' ||
+    !MEMORY_KINDS.includes(value.kind as MemoryKind) ||
+    typeof value.pin !== 'boolean' ||
+    typeof value.score !== 'number' ||
+    !Number.isFinite(value.score) ||
+    !Number.isInteger(value.rank) ||
+    (value.rank as number) < 1
+  ) {
+    return null
+  }
+  const features = parseMemoryFeatures(value.features)
+  if (features === null) {
+    return null
+  }
+  return {
+    memory_id: value.memory_id,
+    label: value.label,
+    body: value.body,
+    kind: value.kind as MemoryKind,
+    pin: value.pin,
+    score: value.score,
+    features,
+    rank: value.rank as number,
+  }
+}
+
 function parseGateOpen(value: unknown): GateOpenPayload | null {
   if (
     !isJsonObject(value) ||
     !isUlid(value.run_id) ||
-    value.kind !== 'memory_gate'
+    value.kind !== 'memory_gate' ||
+    !isUuid(value.injection_id) ||
+    !isIso8601Timestamp(value.snapshot_ts) ||
+    typeof value.scorer_version !== 'string' ||
+    !value.scorer_version.trim() ||
+    !Array.isArray(value.injected) ||
+    !Array.isArray(value.near_misses)
   ) {
     return null
   }
-  return value as GateOpenPayload
+  const injected = value.injected.map(parseScoredMemoryCard)
+  const nearMisses = value.near_misses.map(parseScoredMemoryCard)
+  if (
+    injected.some((card) => card === null) ||
+    nearMisses.some((card) => card === null)
+  ) {
+    return null
+  }
+  const memoryIds = [
+    ...(injected as ScoredMemoryCard[]),
+    ...(nearMisses as ScoredMemoryCard[]),
+  ].map((card) => card.memory_id)
+  if (new Set(memoryIds).size !== memoryIds.length) {
+    return null
+  }
+  return {
+    ...value,
+    run_id: value.run_id,
+    kind: 'memory_gate',
+    injection_id: value.injection_id,
+    snapshot_ts: value.snapshot_ts,
+    scorer_version: value.scorer_version,
+    injected: injected as ScoredMemoryCard[],
+    near_misses: nearMisses as ScoredMemoryCard[],
+  }
 }
 
 function parseTranscriptMessage(value: unknown): TranscriptMessage | null {

@@ -9,6 +9,7 @@ import {
 
 import { harnessClient } from './socket'
 import { useHarnessStore } from './store'
+import { MemoryGate } from './MemoryGate'
 import type {
   AssistantTranscriptMessage,
   ChatMessage,
@@ -54,7 +55,10 @@ function messageStatus(
   activeState: string | undefined,
 ): string | null {
   if (activeRunId === message.run_id) {
-    return activeState === 'cancelling' ? 'Stopping' : 'Streaming'
+    if (activeState === 'cancelling') {
+      return 'Stopping'
+    }
+    return activeState === 'waiting_gate' ? 'Waiting for memory review' : 'Streaming'
   }
   return state === undefined ? (message.partial ? 'Partial' : null) : terminalCopy(state)
 }
@@ -103,10 +107,14 @@ function App() {
       : [...selectedThread.messages, ...optimistic]
   }, [selectedThread])
   const activeRun = selectedThread?.activeRun ?? null
+  const openGate = selectedThread?.openGate ?? null
   const queuedPrompts = selectedThread?.queuedPrompts ?? []
   const awaitingSnapshot = selectedThread?.awaitingSnapshot ?? true
   const canSend =
-    connection === 'connected' && !awaitingSnapshot && draft.trim().length > 0
+    connection === 'connected' &&
+    !awaitingSnapshot &&
+    openGate === null &&
+    draft.trim().length > 0
 
   const runStates = useMemo(() => {
     const states = new Map<string, UserMessageState>()
@@ -334,6 +342,8 @@ function App() {
                   ? 'Not loaded'
                   : liveState === 'cancelling'
                   ? 'Stopping'
+                  : liveState === 'waiting_gate'
+                    ? 'Review memory'
                   : liveState !== undefined
                     ? 'Live'
                     : outboundCount > 0
@@ -367,7 +377,11 @@ function App() {
           </p>
         </aside>
 
-        <main className="chat-panel" aria-labelledby="thread-title" inert={drawerOpen || undefined}>
+        <main
+          className="chat-panel"
+          aria-labelledby="thread-title"
+          inert={drawerOpen || openGate !== null || undefined}
+        >
           <header className="chat-header">
             <div className="chat-header__identity">
               <p className="eyebrow">Current thread</p>
@@ -376,7 +390,11 @@ function App() {
             <div className="run-metrics" aria-label="Run status">
               {activeRun !== null && (
                 <span className={`run-state run-state--${activeRun.state}`}>
-                  {activeRun.state === 'cancelling' ? 'Stopping' : 'Run active'}
+                  {activeRun.state === 'cancelling'
+                    ? 'Stopping'
+                    : activeRun.state === 'waiting_gate'
+                      ? 'Memory review'
+                      : 'Run active'}
                 </span>
               )}
               {queuedPrompts.length > 0 && <span>{queuedPrompts.length} queued</span>}
@@ -457,12 +475,18 @@ function App() {
                 value={draft}
                 rows={1}
                 placeholder={connection === 'connected' ? 'Message Harness' : 'Waiting for connection'}
-                disabled={connection !== 'connected' || awaitingSnapshot}
+                disabled={
+                  connection !== 'connected' || awaitingSnapshot || openGate !== null
+                }
                 onChange={(event) => setDraft(event.target.value)}
                 onKeyDown={onComposerKeyDown}
               />
               <p className="composer__hint">
-                {activeRun === null ? 'Enter to send' : 'New prompts queue at the turn boundary'}
+                {openGate !== null
+                  ? 'Review memory before the model starts'
+                  : activeRun === null
+                    ? 'Enter to send'
+                    : 'New prompts queue at the turn boundary'}
                 <span>Shift+Enter for newline</span>
               </p>
             </div>
@@ -486,6 +510,17 @@ function App() {
           </form>
         </main>
       </div>
+      {openGate !== null && (
+        <MemoryGate
+          key={`${openGate.run_id}:${openGate.injection_id}`}
+          gate={openGate}
+          connected={connection === 'connected'}
+          cancelling={activeRun?.state === 'cancelling'}
+          serverError={selectedThread?.lastError?.detail ?? null}
+          onCommit={(decision) => harnessClient.commitGate(decision)}
+          onStop={cancelRun}
+        />
+      )}
     </div>
   )
 }

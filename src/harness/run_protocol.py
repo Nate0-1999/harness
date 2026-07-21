@@ -4,7 +4,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Protocol
 
-from harness.envelope import StopReason
+from harness.envelope import GateCommitPayload, StopReason
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,7 +51,11 @@ class RunEmitter(Protocol):
 
     async def usage(self, value: UsageSnapshot) -> None: ...
 
-    async def open_gate(self, value: Mapping[str, object]) -> None: ...
+    async def open_gate(self, value: Mapping[str, object]) -> GateCommitPayload: ...
+
+    async def dismiss_gate(self) -> None: ...
+
+    async def error(self, value: Mapping[str, object]) -> None: ...
 
 
 class TurnRunner(Protocol):
@@ -64,4 +68,18 @@ class TurnRunner(Protocol):
         prompt: str,
         message_history: Sequence[object],
         emit: RunEmitter,
+    ) -> TurnOutcome: ...
+
+
+class SystemInstructionTurnRunner(Protocol):
+    """Execute a turn with optional system-adjacent per-run instructions."""
+
+    async def run(
+        self,
+        *,
+        thread_id: str,
+        prompt: str,
+        message_history: Sequence[object],
+        emit: RunEmitter,
+        system_instructions: str | None = None,
     ) -> TurnOutcome: ...

@@ -3,10 +3,13 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Callable, Sequence
+from datetime import UTC, datetime
 from pathlib import Path
+from uuid import UUID
 
 import pytest
 from fastapi.testclient import TestClient
+from pydantic_ai.messages import ModelRequest
 from pydantic_ai.models.function import FunctionModel
 from starlette.websockets import WebSocketDisconnect
 
@@ -16,11 +19,19 @@ from harness.daemon import EnvelopeSender, _build_web, create_app, create_dev_ap
 from harness.envelope import Envelope, EnvelopeFactory, MessageType, StopReason
 from harness.run_loop import RunLoop
 from harness.run_protocol import RunEmitter, TurnOutcome, UsageSnapshot
+from harness.spine_client import (
+    InjectCommitRequest,
+    InjectCommitResponse,
+    InjectPrepareRequest,
+    InjectPrepareResponse,
+    SpineTransportError,
+)
 
 PROMPT_ID = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 SECOND_PROMPT_ID = "01ARZ3NDEKTSV4RRFFQ69G5FAW"
 CANCEL_ID = "01ARZ3NDEKTSV4RRFFQ69G5FAX"
 SNAPSHOT_ID = "01ARZ3NDEKTSV4RRFFQ69G5FAY"
+INJECTION_ID = "32345678-1234-5678-1234-567812345678"
 
 
 def valid_envelope() -> dict[str, object]:
@@ -105,6 +116,39 @@ class CancellableRunner:
                 (*message_history, "first:cancelled-tool"),
                 UsageSnapshot(1, 2, 1),
             )
+
+
+class FailingPrepareSpine:
+    async def prepare_injection(self, request: InjectPrepareRequest) -> InjectPrepareResponse:
+        del request
+        raise SpineTransportError
+
+    async def aclose(self) -> None:
+        pass
+
+
+class GateSpine:
+    def __init__(self) -> None:
+        self.prepare_requests: list[InjectPrepareRequest] = []
+        self.commit_requests: list[InjectCommitRequest] = []
+        self.closed = False
+
+    async def prepare_injection(self, request: InjectPrepareRequest) -> InjectPrepareResponse:
+        self.prepare_requests.append(request)
+        return InjectPrepareResponse(
+            injection_id=UUID(INJECTION_ID),
+            snapshot_ts=datetime(2026, 7, 21, 12, tzinfo=UTC),
+            scorer_version="m1-v1",
+            injected=[],
+            near_misses=[],
+        )
+
+    async def commit_injection(self, request: InjectCommitRequest) -> InjectCommitResponse:
+        self.commit_requests.append(request)
+        return InjectCommitResponse(final_block="trusted memory block", wrong_removed=[])
+
+    async def aclose(self) -> None:
+        self.closed = True
 
 
 def app_with_runner(runner: CancellableRunner, tmp_path: Path):
@@ -219,7 +263,12 @@ def test_dev_app_wires_the_real_streaming_agent_adapter(tmp_path: Path) -> None:
         openrouter_api_key=None,
     )
     agent = HarnessAgent(settings, model=FunctionModel(stream_function=stream))
-    app = create_dev_app(tmp_path, settings=settings, agent=agent)
+    app = create_dev_app(
+        tmp_path,
+        settings=settings,
+        agent=agent,
+        spine=FailingPrepareSpine(),  # type: ignore[arg-type]
+    )
     thread_id = "22345678-1234-5678-1234-567812345678"
 
     with TestClient(app) as client, client.websocket_connect("/ws") as websocket:
@@ -238,6 +287,14 @@ def test_dev_app_wires_the_real_streaming_agent_adapter(tmp_path: Path) -> None:
                 break
 
     assert messages[0]["type"] == "run.started"
+    assert messages[1]["type"] == "error"
+    assert messages[1]["payload"] == {
+        "code": "memory_unavailable",
+        "run_id": messages[0]["payload"]["run_id"],
+        "phase": "prepare",
+        "message": "Memory is unavailable; continuing without injected context.",
+    }
+    assert all(message["type"] != "gate.open" for message in messages)
     assert messages[-1]["payload"]["stop_reason"] == "end_turn"
     assert messages[-1]["payload"]["partial"] is False
     assert any(
@@ -248,6 +305,122 @@ def test_dev_app_wires_the_real_streaming_agent_adapter(tmp_path: Path) -> None:
     )
     assert all(message["machine_id"] == "machine-test" for message in messages)
     assert all(message["agent_id"] == "agent-test" for message in messages)
+
+
+def test_dev_gate_round_trip_blocks_validates_commits_and_injects_system_block(
+    tmp_path: Path,
+) -> None:
+    observed_messages = []
+
+    async def answer(messages, _info):
+        observed_messages.extend(messages)
+        yield "after gate"
+
+    settings = HarnessSettings(
+        _env_file=None,
+        spine_token="test-token",
+        principal_id="principal-test",
+        machine_id="machine-test",
+        agent_id="agent-test",
+        model_context_tokens=777_777,
+        anthropic_api_key=None,
+        openai_api_key=None,
+        openrouter_api_key=None,
+    )
+    agent = HarnessAgent(settings, model=FunctionModel(stream_function=answer))
+    spine = GateSpine()
+    app = create_dev_app(
+        tmp_path,
+        settings=settings,
+        agent=agent,
+        spine=spine,  # type: ignore[arg-type]
+    )
+    thread_id = "22345678-1234-5678-1234-567812345678"
+
+    with TestClient(app) as client, client.websocket_connect("/ws") as websocket:
+        websocket.send_json(frame("prompt.submit", {"prompt": "hello"}, thread_id=thread_id))
+        started = websocket.receive_json()
+        opened = websocket.receive_json()
+        run_id = started["payload"]["run_id"]
+        assert opened["type"] == "gate.open"
+        assert opened["payload"] == {
+            "run_id": run_id,
+            "kind": "memory_gate",
+            "injection_id": INJECTION_ID,
+            "snapshot_ts": "2026-07-21T12:00:00Z",
+            "scorer_version": "m1-v1",
+            "injected": [],
+            "near_misses": [],
+        }
+        assert observed_messages == []
+
+        websocket.send_json(
+            frame(
+                "gate.commit",
+                {
+                    "run_id": run_id,
+                    "injection_id": "42345678-1234-5678-1234-567812345678",
+                    "removed": [],
+                    "added_back": [],
+                },
+                message_id=CANCEL_ID,
+                thread_id=thread_id,
+            )
+        )
+        rejected = websocket.receive_json()
+        assert rejected["type"] == "error"
+        assert rejected["payload"] == {
+            "code": "gate_not_committable",
+            "run_id": run_id,
+        }
+        assert observed_messages == []
+
+        commit_payload = {
+            "run_id": run_id,
+            "injection_id": INJECTION_ID,
+            "removed": [],
+            "added_back": [],
+        }
+        websocket.send_json(
+            frame(
+                "gate.commit",
+                commit_payload,
+                message_id=SNAPSHOT_ID,
+                thread_id=thread_id,
+            )
+        )
+        resumed: list[dict[str, object]] = []
+        while True:
+            message = websocket.receive_json()
+            resumed.append(message)
+            if message["type"] == "run.done":
+                break
+
+        websocket.send_json(
+            frame(
+                "gate.commit",
+                commit_payload,
+                message_id="01ARZ3NDEKTSV4RRFFQ69G5FAZ",
+                thread_id=thread_id,
+            )
+        )
+        duplicate = websocket.receive_json()
+
+    resumed_types = [message["type"] for message in resumed]
+    assert resumed_types[0] == "gate.dismiss"
+    assert "run.delta" in resumed_types
+    assert resumed_types[-1] == "run.done"
+    assert duplicate["type"] == "error"
+    assert duplicate["payload"] == {"code": "gate_not_committable", "run_id": run_id}
+    assert spine.prepare_requests[0].model_context_tokens == 777_777
+    assert spine.commit_requests == [
+        InjectCommitRequest(injection_id=UUID(INJECTION_ID), removed=[], added_back=[])
+    ]
+    requests = [message for message in observed_messages if isinstance(message, ModelRequest)]
+    assert len(requests) == 1
+    assert requests[0].instructions is not None
+    assert requests[0].instructions.endswith("\ntrusted memory block")
+    assert spine.closed is True
 
 
 def test_unimplemented_known_type_uses_fresh_daemon_error(tmp_path: Path) -> None:

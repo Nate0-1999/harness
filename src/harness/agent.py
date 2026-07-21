@@ -16,6 +16,7 @@ from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.providers.openrouter import OpenRouterProvider
 from pydantic_ai.usage import RunUsage
 
+from harness.commands import remember_command_text
 from harness.config import HarnessSettings
 from harness.pydantic_ai_adapter import MemoryCapability
 from harness.spine_client import (
@@ -261,14 +262,3 @@ def _required_secret(value: SecretStr | None, name: str) -> str:
     if value is None or not value.get_secret_value().strip():
         raise ModelConfigurationError(f"{name} is required for the selected model provider")
     return value.get_secret_value()
-
-
-def remember_command_text(text: str) -> str | None:
-    """Return the exact `/remember` argument, or None for ordinary chat."""
-
-    prefix = "/remember"
-    if text == prefix:
-        return ""
-    if text.startswith(prefix) and len(text) > len(prefix) and text[len(prefix)].isspace():
-        return text[len(prefix) :].strip()
-    return None

@@ -13,6 +13,7 @@ from harness.envelope import (
     ActiveRunSnapshot,
     Envelope,
     EnvelopeFactory,
+    GateCommitPayload,
     GateDismissPayload,
     GateOpenPayload,
     MessageType,
@@ -52,6 +53,8 @@ class _ActiveRun:
     usage: UsageSnapshot = UsageSnapshot()
     usage_emitted: bool = False
     task: asyncio.Task[None] | None = None
+    gate_decision: asyncio.Future[GateCommitPayload] | None = None
+    gate_committing: bool = False
 
 
 @dataclass(slots=True)
@@ -93,8 +96,14 @@ class _Emitter(RunEmitter):
     async def usage(self, value: UsageSnapshot) -> None:
         await self._loop._emit_usage(self._thread_id, self._active, value)
 
-    async def open_gate(self, value: Mapping[str, object]) -> None:
-        await self._loop._emit_gate(self._thread_id, self._active, value)
+    async def open_gate(self, value: Mapping[str, object]) -> GateCommitPayload:
+        return await self._loop._emit_gate(self._thread_id, self._active, value)
+
+    async def dismiss_gate(self) -> None:
+        await self._loop._dismiss_gate(self._thread_id, self._active)
+
+    async def error(self, value: Mapping[str, object]) -> None:
+        await self._loop._emit_error(self._thread_id, self._active, value)
 
 
 class RunLoop:
@@ -299,6 +308,50 @@ class RunLoop:
                 if active.task is not None:
                     active.task.cancel()
 
+    async def commit_gate(
+        self,
+        *,
+        thread_id: str,
+        decision: GateCommitPayload,
+        sink: EnvelopeSink | None = None,
+    ) -> None:
+        """Resolve one matching open gate, or return a scoped non-mutating error."""
+
+        self._require_thread_id(thread_id)
+        async with self._lock:
+            self._require_open()
+            state = self._threads.get(thread_id)
+            active = state.active if state is not None else None
+            gate = state.open_gate if state is not None else None
+            invalid = (
+                active is None
+                or gate is None
+                or active.state != "waiting_gate"
+                or active.turn.run_id != decision.run_id
+                or gate.run_id != decision.run_id
+                or gate.injection_id != decision.injection_id
+                or active.gate_committing
+                or active.gate_decision is None
+                or active.gate_decision.done()
+                or not self._valid_gate_membership(gate, decision)
+            )
+            if invalid:
+                error = self._factory.create(
+                    MessageType.ERROR,
+                    {"code": "gate_not_committable", "run_id": decision.run_id},
+                    thread_id=thread_id,
+                )
+                if sink is not None:
+                    await self._send_direct_locked(sink, error)
+                else:
+                    await self._publish_locked(thread_id, error)
+                return
+
+            if sink is not None:
+                self._bind_sink_locked(sink, thread_id)
+            active.gate_committing = True
+            active.gate_decision.set_result(decision)
+
     async def close(self) -> None:
         """Cancel daemon-owned tasks during app shutdown and reject new work."""
 
@@ -447,6 +500,8 @@ class RunLoop:
             active.turn.user_message["state"] = stop_reason.value
 
             if state.open_gate is not None:
+                if active.gate_decision is not None and not active.gate_decision.done():
+                    active.gate_decision.cancel()
                 await self._publish_locked(
                     thread_id,
                     self._factory.create(
@@ -456,6 +511,8 @@ class RunLoop:
                     ),
                 )
                 state.open_gate = None
+                active.gate_decision = None
+                active.gate_committing = False
 
             await self._publish_locked(
                 thread_id,
@@ -581,14 +638,18 @@ class RunLoop:
         thread_id: str,
         active: _ActiveRun,
         value: Mapping[str, object],
-    ) -> None:
+    ) -> GateCommitPayload:
         raw = {**dict(value), "run_id": active.turn.run_id, "kind": "memory_gate"}
         payload = GateOpenPayload.model_validate(raw)
+        decision = asyncio.get_running_loop().create_future()
         async with self._lock:
             state = self._live_state_locked(thread_id, active)
             if state is None:
-                return
+                raise RuntimeError("cannot open a gate for an inactive run")
+            if state.open_gate is not None or active.gate_decision is not None:
+                raise RuntimeError("run already has an open gate")
             active.state = "waiting_gate"
+            active.gate_decision = decision
             state.open_gate = payload
             await self._publish_locked(
                 thread_id,
@@ -598,6 +659,62 @@ class RunLoop:
                     thread_id=thread_id,
                 ),
             )
+        return await decision
+
+    async def _dismiss_gate(self, thread_id: str, active: _ActiveRun) -> None:
+        async with self._lock:
+            state = self._live_state_locked(thread_id, active)
+            if state is None:
+                raise RuntimeError("cannot dismiss a gate for an inactive run")
+            if state.open_gate is None or active.gate_decision is None:
+                raise RuntimeError("run has no open gate")
+            await self._publish_locked(
+                thread_id,
+                self._factory.create(
+                    MessageType.GATE_DISMISS,
+                    GateDismissPayload(run_id=active.turn.run_id),
+                    thread_id=thread_id,
+                ),
+            )
+            state.open_gate = None
+            active.gate_decision = None
+            active.gate_committing = False
+            active.state = "running"
+
+    async def _emit_error(
+        self,
+        thread_id: str,
+        active: _ActiveRun,
+        value: Mapping[str, object],
+    ) -> None:
+        raw = {**dict(value), "run_id": active.turn.run_id}
+        async with self._lock:
+            state = self._live_state_locked(thread_id, active)
+            if state is None:
+                return
+            await self._publish_locked(
+                thread_id,
+                self._factory.create(
+                    MessageType.ERROR,
+                    raw,
+                    thread_id=thread_id,
+                ),
+            )
+
+    @staticmethod
+    def _valid_gate_membership(
+        gate: GateOpenPayload,
+        decision: GateCommitPayload,
+    ) -> bool:
+        removed = [item.memory_id for item in decision.removed]
+        added_back = list(decision.added_back)
+        if len(set(removed)) != len(removed) or len(set(added_back)) != len(added_back):
+            return False
+        if set(removed).intersection(added_back):
+            return False
+        injected = {card.memory_id for card in gate.injected}
+        near_misses = {card.memory_id for card in gate.near_misses}
+        return set(removed).issubset(injected) and set(added_back).issubset(near_misses)
 
     def _live_state_locked(
         self,

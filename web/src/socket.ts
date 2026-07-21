@@ -6,6 +6,7 @@ import {
   type BrowserMessageType,
   type BrowserPayloadMap,
   type Envelope,
+  type GateCommitPayload,
   type Ulid,
 } from './protocol'
 import { useHarnessStore, type HarnessStoreState } from './store'
@@ -136,6 +137,22 @@ export class HarnessSocketClient {
     )
     useHarnessStore.getState().markCancelling(threadId, selectedRunId)
     return envelope.id
+  }
+
+  commitGate(decision: GateCommitPayload): Ulid {
+    const state = useHarnessStore.getState()
+    const threadId = state.selectedThreadId
+    const openGate = selectedRuntime(state)?.openGate
+    if (threadId === null || openGate == null) {
+      throw new Error('there is no open memory gate to continue')
+    }
+    if (
+      decision.run_id !== openGate.run_id ||
+      decision.injection_id !== openGate.injection_id
+    ) {
+      throw new Error('the memory decision does not match the open gate')
+    }
+    return this.send('gate.commit', decision, threadId).id
   }
 
   private openSocket(reconnecting: boolean): void {

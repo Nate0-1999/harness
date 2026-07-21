@@ -322,3 +322,51 @@ state store add behavior H4 does not need. A font CDN makes the local shell
 network-dependent, while fake bundled font files would be dishonest evidence.
 Prebuilding H5/H6 surfaces or ornamental scaffolding would violate the M1 scope
 fence and least-attention invariant.
+
+## 012 — One-shot first-chat memory gate [P1.2.1a–c, P2, P3]
+
+**Decision.** Adopt Garden A-019 as the executable H5 boundary. Wrap the
+framework-neutral turn runner with one process-lifetime gate attempt per thread:
+the first ordinary chat prepares against Spine, resolves one `RunLoop`-owned
+future from a strictly correlated browser decision, commits with the
+server-held injection ID, dismisses, and passes the exact final block as
+system-adjacent pydantic-ai instructions. `/remember` neither opens nor consumes
+the attempt. Source the context window from positive
+`MODEL_CONTEXT_TOKENS=1000000`, aligned with the default M3 model.
+
+Carry the full C.4 scored-card shape over exact `gate.open`/`gate.commit`
+extensions and render full bodies, total score, UUID, and all six raw M1 feature
+scores in a native modal dialog. A plain × means `not_relevant`; Alt-× or touch
+hold exposes Wrong/Never; near misses are explicit add-backs. Keep Stop and
+Continue inside the modal, preserve choices only for its mounted lifetime, and
+reject Escape, backdrop, queued prompt, malformed cards, stale correlation,
+membership drift, duplicate IDs, and double submission. Only a typed Spine
+prepare/commit failure fails memory open with a visible warning and a memoryless
+chat call; validation and programming faults remain run errors.
+
+Verify the entire path with a fixture that keeps the production SPA, WebSocket,
+daemon, run loop, typed client, and deployed Spine, replacing only the
+downstream chat model with a streaming deterministic `FunctionModel`. Seed and
+clean only retained exact IDs, pin four cards, force one regular near miss with
+a one-token fixture context, hash arbitrary prompts in traces, and preserve
+separate desktop/mobile traces and rendered evidence. B.6 rule 8 adds a
+first-person SOP, fail-open screenshots, and unscripted friction alongside the
+deterministic assertions.
+
+**Motivation.** A server-owned future makes the hard pause a lifecycle fact,
+not UI timing, while exact correlation and membership validation keep browser
+state from becoming authority. Dynamic instructions preserve the user prompt
+as user data and place committed memory where the model expects trusted
+context. Native dialog/inert behavior, sticky 44px controls, and full raw-score
+cards make the one consequential review interrupt legible on desktop and
+phone. Deployed-Spine evidence covers the semantic path without spending or
+masking a hosted chat call.
+
+**Rejected alternatives.** A timeout or automatic continue violates ADR-005.
+Letting `/remember` consume the gate surprises the next ordinary chat. Trusting
+the browser's injection ID, retrying stale commits, or caching an offline block
+weakens the authority boundary. Rendering M2 weighted contributions would lie
+about C.4's raw features. Folding command parsing into the agent adapter couples
+service routing to pydantic-ai, so the parser lives in a small framework-free
+module. H6 editing, per-prompt rescoring, retry UX, durable gate persistence,
+and explanatory training copy remain later work rather than H5 scope creep.

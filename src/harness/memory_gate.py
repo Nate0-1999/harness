@@ -1,0 +1,165 @@
+"""Framework-neutral first-chat memory injection gate orchestration."""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Sequence
+from typing import Protocol
+
+from harness.commands import remember_command_text
+from harness.run_protocol import (
+    RunEmitter,
+    SystemInstructionTurnRunner,
+    TurnOutcome,
+)
+from harness.spine_client import (
+    InjectCommitRequest,
+    InjectCommitResponse,
+    InjectPrepareRequest,
+    InjectPrepareResponse,
+    SpineClientError,
+)
+from harness.tools_memory import MemoryToolContext
+
+type ContextFactory = Callable[[str], MemoryToolContext]
+
+_MEMORY_UNAVAILABLE_MESSAGE = "Memory is unavailable; continuing without injected context."
+
+
+class InjectionGateway(Protocol):
+    """The two C.4 operations used by the first-chat injection flow."""
+
+    async def prepare_injection(self, request: InjectPrepareRequest) -> InjectPrepareResponse: ...
+
+    async def commit_injection(self, request: InjectCommitRequest) -> InjectCommitResponse: ...
+
+
+class MemoryGateTurnRunner:
+    """Gate the first ordinary chat in each daemon-lifetime thread exactly once."""
+
+    def __init__(
+        self,
+        delegate: SystemInstructionTurnRunner,
+        spine: InjectionGateway,
+        context_factory: ContextFactory,
+        *,
+        model_context_tokens: int,
+    ) -> None:
+        if type(model_context_tokens) is not int or model_context_tokens <= 0:
+            raise ValueError("model_context_tokens must be a positive integer")
+        self._delegate = delegate
+        self._spine = spine
+        self._context_factory = context_factory
+        self._model_context_tokens = model_context_tokens
+        self._attempted_threads: set[str] = set()
+
+    async def run(
+        self,
+        *,
+        thread_id: str,
+        prompt: str,
+        message_history: Sequence[object],
+        emit: RunEmitter,
+    ) -> TurnOutcome:
+        """Prepare, block for a valid decision, commit, then invoke the model."""
+
+        if remember_command_text(prompt) is not None or thread_id in self._attempted_threads:
+            return await self._run_model(
+                thread_id=thread_id,
+                prompt=prompt,
+                message_history=message_history,
+                emit=emit,
+            )
+
+        # Claim before any fallible work. A cancelled or failed attempt must not
+        # surprise the human with a later first-turn gate in this process.
+        self._attempted_threads.add(thread_id)
+        context = self._context_factory(thread_id)
+        if context.thread_id is None:
+            raise ValueError("memory gate context requires a thread_id")
+
+        try:
+            prepared = await self._spine.prepare_injection(
+                InjectPrepareRequest(
+                    thread_id=context.thread_id,
+                    agent_id=context.agent_id,
+                    machine_id=context.machine_id,
+                    principal_id=context.principal_id,
+                    project_key=context.project_key,
+                    agent_kind=None,
+                    prompt=prompt,
+                    model_context_tokens=self._model_context_tokens,
+                )
+            )
+        except SpineClientError:
+            await self._memory_unavailable(emit, phase="prepare")
+            return await self._run_model(
+                thread_id=thread_id,
+                prompt=prompt,
+                message_history=message_history,
+                emit=emit,
+            )
+
+        decision = await emit.open_gate(
+            {
+                "injection_id": prepared.injection_id,
+                "snapshot_ts": prepared.snapshot_ts,
+                "scorer_version": prepared.scorer_version,
+                "injected": prepared.injected,
+                "near_misses": prepared.near_misses,
+            }
+        )
+
+        try:
+            committed = await self._spine.commit_injection(
+                InjectCommitRequest(
+                    # Never trust the echoed browser ID at the C.4 boundary.
+                    injection_id=prepared.injection_id,
+                    removed=decision.removed,
+                    added_back=decision.added_back,
+                )
+            )
+        except SpineClientError:
+            await self._memory_unavailable(emit, phase="commit")
+            await emit.dismiss_gate()
+            return await self._run_model(
+                thread_id=thread_id,
+                prompt=prompt,
+                message_history=message_history,
+                emit=emit,
+            )
+
+        await emit.dismiss_gate()
+        return await self._run_model(
+            thread_id=thread_id,
+            prompt=prompt,
+            message_history=message_history,
+            emit=emit,
+            system_instructions=committed.final_block,
+        )
+
+    async def _run_model(
+        self,
+        *,
+        thread_id: str,
+        prompt: str,
+        message_history: Sequence[object],
+        emit: RunEmitter,
+        system_instructions: str | None = None,
+    ) -> TurnOutcome:
+        return await self._delegate.run(
+            thread_id=thread_id,
+            prompt=prompt,
+            message_history=message_history,
+            emit=emit,
+            system_instructions=system_instructions,
+        )
+
+    @staticmethod
+    async def _memory_unavailable(emit: RunEmitter, *, phase: str) -> None:
+        await emit.error(
+            {
+                "code": "memory_unavailable",
+                "phase": phase,
+                "message": _MEMORY_UNAVAILABLE_MESSAGE,
+            }
+        )

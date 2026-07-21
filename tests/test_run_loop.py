@@ -5,12 +5,14 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
+from uuid import UUID
 
 import pytest
 
 from harness.envelope import (
     Envelope,
     EnvelopeFactory,
+    GateCommitPayload,
     MessageType,
     StopReason,
     ThreadSnapshotResponsePayload,
@@ -19,6 +21,39 @@ from harness.run_loop import RunLoop
 from harness.run_protocol import RunEmitter, TurnOutcome, UsageSnapshot
 
 TEST_TIMEOUT = 1.0
+INJECTION_ID = "32345678-1234-5678-1234-567812345678"
+INJECTED_ID = "42345678-1234-5678-1234-567812345678"
+NEAR_MISS_ID = "52345678-1234-5678-1234-567812345678"
+
+
+def gate_value() -> dict[str, object]:
+    return {
+        "injection_id": INJECTION_ID,
+        "snapshot_ts": datetime(2026, 7, 21, 12, tzinfo=UTC),
+        "scorer_version": "m1-v1",
+        "injected": [],
+        "near_misses": [],
+    }
+
+
+def card(memory_id: str, rank: int) -> dict[str, object]:
+    return {
+        "memory_id": memory_id,
+        "label": f"memory-{rank}",
+        "body": f"full body {rank}",
+        "kind": "fact",
+        "pin": False,
+        "score": 0.8,
+        "features": {
+            "sem": 0.9,
+            "kw": 0.8,
+            "time": 0.7,
+            "proj": 0.6,
+            "freq": 0.5,
+            "hist": 0.4,
+        },
+        "rank": rank,
+    }
 
 
 def ulid(number: int) -> str:
@@ -120,6 +155,59 @@ class ImmediateHistoryRunner:
         )
 
 
+class GateRunner:
+    def __init__(self) -> None:
+        self.accepted = asyncio.Event()
+        self.allow_dismiss = asyncio.Event()
+        self.decision: GateCommitPayload | None = None
+
+    async def run(
+        self,
+        *,
+        thread_id: str,
+        prompt: str,
+        message_history: Sequence[object],
+        emit: RunEmitter,
+    ) -> TurnOutcome:
+        del thread_id
+        self.decision = await emit.open_gate(
+            {
+                **gate_value(),
+                "injected": [card(INJECTED_ID, 1)],
+                "near_misses": [card(NEAR_MISS_ID, 2)],
+            }
+        )
+        self.accepted.set()
+        await self.allow_dismiss.wait()
+        await emit.dismiss_gate()
+        await emit.text("model started")
+        return TurnOutcome(
+            StopReason.END_TURN,
+            (*message_history, f"{prompt}:complete"),
+        )
+
+
+class InvalidGateRunner:
+    async def run(
+        self,
+        *,
+        thread_id: str,
+        prompt: str,
+        message_history: Sequence[object],
+        emit: RunEmitter,
+    ) -> TurnOutcome:
+        del thread_id, prompt, message_history
+        invalid = card(INJECTED_ID, 0)
+        await emit.open_gate(
+            {
+                **gate_value(),
+                "injected": [invalid],
+                "near_misses": [invalid],
+            }
+        )
+        raise AssertionError("invalid gate unexpectedly opened")
+
+
 class FinishBarrierLoop(RunLoop):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -196,7 +284,8 @@ async def test_cancel_awaits_cleanup_preserves_partial_and_coalesces_duplicates(
     await emit.thinking("kept thought")
     await emit.event({"tool": "started"})
     await emit.usage(UsageSnapshot(1, 12, 3))
-    await emit.open_gate({"memory_id": "memory-1"})
+    gate_wait = asyncio.create_task(emit.open_gate(gate_value()))
+    await _wait_for_type_count(sink, MessageType.GATE_OPEN, 1)
 
     first = asyncio.create_task(loop.cancel(thread_id=None, run_id=run_id, sink=sink))
     await _wait(control.cancellation_seen)
@@ -207,6 +296,8 @@ async def test_cancel_awaits_cleanup_preserves_partial_and_coalesces_duplicates(
 
     control.cleanup_release.set()
     await _wait_for_done_count(sink, 1)
+    with pytest.raises(asyncio.CancelledError):
+        await gate_wait
 
     message_types = types(sink)
     assert message_types.count(MessageType.RUN_DONE) == 1
@@ -236,6 +327,156 @@ async def test_cancel_awaits_cleanup_preserves_partial_and_coalesces_duplicates(
     assert assistant["thinking"] == "kept thought"
     assert assistant["events"] == [{"tool": "started"}]
     assert assistant["partial"] is True
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_gate_blocks_reconnects_validates_once_and_resumes_only_after_dismiss() -> None:
+    ids = Ids()
+    runner = GateRunner()
+    loop = RunLoop(runner, factory(ids))
+    original = Sink()
+    await loop.attach(original)
+    run_id = await loop.submit(
+        thread_id="thread-1",
+        prompt_id=ulid(1),
+        prompt="hello",
+        sink=original,
+    )
+    await _wait_for_type_count(original, MessageType.GATE_OPEN, 1)
+    assert MessageType.RUN_DELTA not in types(original)
+
+    await loop.detach(original)
+    reconnected = Sink()
+    await loop.attach(reconnected)
+    await _wait_for_type_count(reconnected, MessageType.THREAD_SNAPSHOT, 1)
+    snapshot = reconnected.messages[0].payload
+    assert isinstance(snapshot, ThreadSnapshotResponsePayload)
+    assert snapshot.open_gate is not None
+    assert snapshot.open_gate.injection_id == UUID(INJECTION_ID)
+    assert snapshot.active_run is not None
+    assert snapshot.active_run.state == "waiting_gate"
+
+    invalid = [
+        (
+            "wrong-thread",
+            GateCommitPayload(
+                run_id=run_id,
+                injection_id=INJECTION_ID,
+                removed=[],
+                added_back=[],
+            ),
+        ),
+        (
+            "thread-1",
+            GateCommitPayload(
+                run_id=ulid(999),
+                injection_id=INJECTION_ID,
+                removed=[],
+                added_back=[],
+            ),
+        ),
+        (
+            "thread-1",
+            GateCommitPayload(
+                run_id=run_id,
+                injection_id="62345678-1234-5678-1234-567812345678",
+                removed=[],
+                added_back=[],
+            ),
+        ),
+        (
+            "thread-1",
+            GateCommitPayload(
+                run_id=run_id,
+                injection_id=INJECTION_ID,
+                removed=[
+                    {
+                        "memory_id": "72345678-1234-5678-1234-567812345678",
+                        "reason": "wrong",
+                    }
+                ],
+                added_back=[],
+            ),
+        ),
+        (
+            "thread-1",
+            GateCommitPayload(
+                run_id=run_id,
+                injection_id=INJECTION_ID,
+                removed=[],
+                added_back=[NEAR_MISS_ID, NEAR_MISS_ID],
+            ),
+        ),
+    ]
+    for count, (thread_id, decision) in enumerate(invalid, start=1):
+        await loop.commit_gate(thread_id=thread_id, decision=decision, sink=reconnected)
+        await _wait_for_type_count(reconnected, MessageType.ERROR, count)
+        assert not runner.accepted.is_set()
+
+    decision = GateCommitPayload(
+        run_id=run_id,
+        injection_id=INJECTION_ID,
+        removed=[{"memory_id": INJECTED_ID, "reason": "not_relevant"}],
+        added_back=[NEAR_MISS_ID],
+    )
+    await loop.commit_gate(thread_id="thread-1", decision=decision, sink=reconnected)
+    await _wait(runner.accepted)
+    assert runner.decision == decision
+    assert MessageType.GATE_DISMISS not in types(reconnected)
+    assert MessageType.RUN_DELTA not in types(reconnected)
+
+    await loop.commit_gate(thread_id="thread-1", decision=decision, sink=reconnected)
+    await _wait_for_type_count(reconnected, MessageType.ERROR, len(invalid) + 1)
+
+    await loop.request_snapshot("thread-1", reconnected)
+    await _wait_for_type_count(reconnected, MessageType.THREAD_SNAPSHOT, 2)
+    in_flight = reconnected.messages[-1].payload
+    assert isinstance(in_flight, ThreadSnapshotResponsePayload)
+    assert in_flight.open_gate is not None
+    assert in_flight.active_run is not None
+    assert in_flight.active_run.state == "waiting_gate"
+
+    runner.allow_dismiss.set()
+    await _wait_for_done_count(reconnected, 1)
+    resumed_types = types(reconnected)
+    assert resumed_types.index(MessageType.GATE_DISMISS) < resumed_types.index(
+        MessageType.RUN_DELTA
+    )
+    assert resumed_types.index(MessageType.RUN_DELTA) < resumed_types.index(MessageType.RUN_DONE)
+    assert all(
+        payload(message) == {"code": "gate_not_committable", "run_id": expected.run_id}
+        for message, (_, expected) in zip(
+            [message for message in reconnected.messages if message.type is MessageType.ERROR],
+            [*invalid, ("thread-1", decision)],
+            strict=True,
+        )
+    )
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_invalid_gate_payload_ends_the_run_instead_of_stranding_the_ui() -> None:
+    ids = Ids()
+    loop = RunLoop(InvalidGateRunner(), factory(ids))
+    sink = Sink()
+    await loop.attach(sink)
+
+    run_id = await loop.submit(
+        thread_id="thread-1",
+        prompt_id=ulid(1),
+        prompt="hello",
+        sink=sink,
+    )
+    await _wait_for_done_count(sink, 1)
+
+    assert MessageType.GATE_OPEN not in types(sink)
+    done = next(message for message in sink.messages if message.type is MessageType.RUN_DONE)
+    assert payload(done) == {
+        "run_id": run_id,
+        "stop_reason": StopReason.ERROR,
+        "partial": True,
+    }
     await loop.close()
 
 
